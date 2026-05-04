@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.xlsx
+*.xlsm
+*.tmp
+build/
+dist/
+*.log
+.vscode/
+.idea/
+*.spec
+*.lnk
+vector_db/
+autosave.laisheet
