@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import sys
 import uuid
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -47,8 +49,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ai import OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
-from document import crop_normalized, page_count, render_page, supported_file_filter
+from ai import DEFAULT_GEMINI_MODEL, GeminiClient, OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
+from document import crop_normalized, existing_supported, page_count, render_page, supported_file_filter
 from formula import FormulaEngine, column_name
 from templates import APP_DIR, ExtractionTemplate, TemplateField, TemplateStore
 from widgets import ImageSelectionCanvas
@@ -66,13 +68,16 @@ except ImportError:
 NATIVE_FILE_FILTER = "Local AI Sheet (*.laisheet)"
 AUTOSAVE_FILE = APP_DIR / "autosave.laisheet"
 MONEY_CHECK_COLUMN = "Money Check"
+CLOUD_VERSION_COLUMN = "Cloud Version"
 
 VISION_MODEL_PRESETS = [
-    ("Gemma 3 12B - Tamil vision", "gemma3:12b"),
-    ("Gemma 4 E2B - lighter", "gemma4:e2b"),
-    ("Gemma 4 26B - stronger", "gemma4:26b"),
-    ("Gemma 4 31B - strongest", "gemma4:31b"),
-    ("Qwen 2.5 VL 7B", "qwen2.5vl:7b"),
+    ("Qwen 2.5 VL (Best for Tamil OCR)", "qwen2.5-vl"),
+    ("MiniCPM-V 2.6 (Fast & Accurate)", "minicpm-v"),
+    ("Llama 3.2 Vision (Strong Reasoning)", "llama3.2-vision"),
+    ("Gemma 3 12B (Tamil Reasoning Only)", "gemma3:12b"),
+    ("Gemma 4 E4B (Balanced)", "gemma4:e4b"),
+    ("Gemma 4 26B (Advanced)", "gemma4:26b"),
+    ("Gemma 4 31B (Strongest Reasoning)", "gemma4:31b"),
 ]
 
 
@@ -184,6 +189,7 @@ class SpreadsheetWidget(QWidget):
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
         self.table.horizontalHeader().sectionResized.connect(lambda: self.table.resizeRowsToContents())
+        self.table.setFont(QFont("Nirmala UI", 10))
 
         # Right-click context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -307,7 +313,14 @@ class SpreadsheetWidget(QWidget):
             ("❌ Row", self.delete_row, "danger", None),
             ("❌ Col", self.delete_column, "danger", None),
         ]
-        
+
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont("Nirmala UI"))
+        self.font_combo.setFixedWidth(180)
+        self.font_combo.currentFontChanged.connect(self.apply_font)
+        style_tool_button(self.font_combo, "format")
+        row2_layout.addWidget(self.font_combo)
+
         for layout, actions in [(row1_layout, actions_row1), (row2_layout, actions_row2)]:
             for label, handler, tone, shortcut in actions:
                 if label is None:
@@ -442,6 +455,14 @@ class SpreadsheetWidget(QWidget):
             font = item.font()
             font.setUnderline(not font.underline())
             item.setFont(font)
+        self._mark_changed()
+
+    def apply_font(self, font: QFont) -> None:
+        family = font.family()
+        for item in self.selected_items_or_cells():
+            f = item.font()
+            f.setFamily(family)
+            item.setFont(f)
         self._mark_changed()
 
     def apply_text_color(self) -> None:
@@ -882,6 +903,11 @@ class SpreadsheetWidget(QWidget):
         return first_row
 
     def append_extraction_rows(self, template: ExtractionTemplate, rows: list[dict[str, str]]) -> tuple[int, int]:
+        template_fields = template.field_names()
+        rows = [
+            row for row in rows
+            if any(_is_meaningful_extracted_value(row.get(field_name, "")) for field_name in template_fields)
+        ]
         if not rows:
             return self._next_empty_row(), 0
         checks = [money_check(row) for row in rows]
@@ -889,7 +915,7 @@ class SpreadsheetWidget(QWidget):
         self.set_template_columns(template, include_money_check)
         first_row = self._next_empty_row()
         current_row = first_row
-        fields = template.field_names()
+        fields = template_fields
         if include_money_check:
             fields = fields + [MONEY_CHECK_COLUMN]
         self._updating = True
@@ -1117,7 +1143,8 @@ class SpreadsheetWidget(QWidget):
 
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
-            sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
+            c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
+            c.font = Font(name="Nirmala UI", bold=True)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -1133,6 +1160,7 @@ class SpreadsheetWidget(QWidget):
                     background = item.background()
                     font_color = qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None
                     cell.font = Font(
+                        name=font.family(),
                         bold=font.bold(),
                         italic=font.italic(),
                         underline="single" if font.underline() else None,
@@ -1355,7 +1383,7 @@ class ExtractionWidget(QWidget):
         for label, value in VISION_MODEL_PRESETS:
             self.model_preset.addItem(label, value)
         self.model_preset.currentIndexChanged.connect(self.apply_model_preset)
-        self.vision_model = QLineEdit("gemma3:12b")
+        self.vision_model = QLineEdit("qwen2.5vl:7b")
         self.language_hint = QLineEdit("Tamil and English")
         self.use_ai = QCheckBox("Use Ollama vision")
         self.use_ai.setChecked(True)
@@ -1738,14 +1766,30 @@ DEFAULT_PETITION_HEADERS = [
 ]
 
 DEFAULT_PETITION_PROMPT = (
-    "You are an expert data extractor. I will provide you with a transcription of Tamil legal/financial petitions. "
-    "This text may represent one single petition spanning multiple pages, or multiple different petitions.\n"
-    "The text is from an OCR engine, expect typos and broken spacing.\n"
-    "Pay extreme attention to Crime Numbers (e.g., Cr.No, FIR No, Crime No) and Scheme Names/Company Names. "
-    "Use logical deduction to reconstruct fragmented Tamil or English names.\n"
-    "IMPORTANT: For fields like 'ID Number', 'Plan Name', or 'Scheme Name', if they appear in English in the "
-    "original text, preserve the exact English text. Do NOT translate them into Tamil."
+    "You are an expert document analyzer. Your task is to extract structured data from the provided document (which may be a petition, an order, or a legal statement).\n"
+    "1. Understand the context and layout of the document.\n"
+    "2. Identify the most relevant values for each requested field, even if the format varies.\n"
+    "3. Handle Tamil and English text correctly. Preserve Tamil script exactly as Unicode Tamil.\n"
+    "4. If a field spans multiple lines or is fragmented, reconstruct it logically.\n"
+    "5. Return a JSON array of objects representing the extracted data entries."
 )
+
+
+EMPTY_EXTRACTED_VALUES = {"", "not specified", "not found", "n/a", "na", "none", "null", "-", "--"}
+
+
+def _is_meaningful_extracted_value(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in EMPTY_EXTRACTED_VALUES
+
+
+def _clean_extracted_rows(rows: list[dict[str, str]], headers: list[str]) -> list[dict[str, str]]:
+    cleaned: list[dict[str, str]] = []
+    for row in rows:
+        values = {header: str(row.get(header, "") or "").strip() for header in headers}
+        if any(_is_meaningful_extracted_value(value) for value in values.values()):
+            cleaned.append(values)
+    return cleaned
 
 
 class PetitionThread(QThread):
@@ -1753,68 +1797,100 @@ class PetitionThread(QThread):
     all_finished = Signal()
     error = Signal(str)
     progress = Signal(str, int, int)
+    file_finished = Signal(str, int)
+    file_warning = Signal(str)
 
-    def __init__(self, file_paths, headers, instruction, model_name):
+    def __init__(
+        self,
+        file_paths,
+        headers,
+        instruction,
+        model_name,
+        host="http://localhost:11434",
+        engine="local",
+        gemini_api_key="",
+    ):
         super().__init__()
         self.file_paths = file_paths
         self.headers = headers
         self.instruction = instruction
         self.model_name = model_name
+        self.host = host
+        self.engine = engine
+        self.gemini_api_key = gemini_api_key
 
     def run(self):
-        import json as _json
+        from PIL import Image as PILImage
+        import fitz
+
+        if self.engine == "gemini":
+            client = GeminiClient(api_key=self.gemini_api_key, model=self.model_name or DEFAULT_GEMINI_MODEL)
+            is_vision = True
+        else:
+            client = OllamaClient(host=self.host, vision_model=self.model_name, chat_model=self.model_name)
+            is_vision = client.is_vision_model(self.model_name)
+
         try:
-            import pytesseract
-        except ImportError:
-            self.error.emit("pytesseract is not installed.")
-            self.all_finished.emit()
-            return
-        try:
-            self.progress.emit("OCR processing...", 0, len(self.file_paths))
-            combined_text = ""
-            total = len(self.file_paths)
+            total_files = len(self.file_paths)
             for i, file_path in enumerate(self.file_paths, 1):
                 base_name = Path(file_path).name
-                self.progress.emit(f"[{i}/{total}] OCR: {base_name}", i, total)
-                if file_path.lower().endswith('.pdf'):
-                    import fitz
-                    from PIL import Image as PILImage
-                    doc = fitz.open(file_path)
-                    for page in doc:
-                        # Render page to image with 2x zoom (DPI=144 is 2x zoom if default is 72)
-                        # fitz.Matrix(2, 2) is clearer for 2x zoom
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                        img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                        combined_text += pytesseract.image_to_string(img, lang='tam+eng') + "\n\n"
-                    doc.close()
-                else:
-                    combined_text += pytesseract.image_to_string(file_path, lang='tam+eng') + "\n\n"
-            if not combined_text.strip():
-                self.error.emit("No text extracted from files.")
-                self.all_finished.emit()
-                return
-            self.progress.emit("Analyzing with LLM...", total, total)
-            headers_json = _json.dumps({h: "" for h in self.headers}, indent=2, ensure_ascii=False)
-            prompt = f"""{self.instruction}\n\nExtract and output ONLY a raw JSON array of objects with these keys for EACH petition:\n[\n{headers_json}\n]\n\nText:\n{combined_text}"""
-            import urllib.request
-            payload = _json.dumps({"model": self.model_name, "messages": [{"role": "user", "content": prompt}], "stream": False, "options": {"temperature": 0}}).encode()
-            req = urllib.request.Request("http://localhost:11434/api/chat", data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                data = _json.loads(resp.read().decode())
-            output_text = data.get("message", {}).get("content", "")
-            if "```json" in output_text:
-                output_text = output_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in output_text:
-                output_text = output_text.split("```")[1].split("```")[0].strip()
-            parsed = _json.loads(output_text)
-            if isinstance(parsed, list):
-                for petition in parsed:
-                    self.row_extracted.emit(petition)
-            elif isinstance(parsed, dict):
-                self.row_extracted.emit(parsed)
+                self.progress.emit(f"[{i}/{total_files}] Processing: {base_name}", i - 1, total_files)
+                images: list[PILImage.Image] = []
+                text = ""
+                try:
+                    if file_path.lower().endswith(".pdf"):
+                        doc = fitz.open(file_path)
+                        try:
+                            for page in doc:
+                                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                                img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                                if is_vision:
+                                    images.append(img)
+                                else:
+                                    text += self._ocr_image(img) + "\n\n"
+                        finally:
+                            doc.close()
+                    else:
+                        img = PILImage.open(file_path).convert("RGB")
+                        if is_vision:
+                            images.append(img)
+                        else:
+                            text += self._ocr_image(img) + "\n\n"
+
+                    self.progress.emit(f"[{i}/{total_files}] Analyzing: {base_name}", i, total_files)
+                    results = client.extract_flexible(
+                        headers=self.headers,
+                        images=images if images else None,
+                        text=text if text else None,
+                        instruction=self.instruction,
+                    )
+                except Exception as exc:
+                    self.file_warning.emit(f"{base_name}: {exc}")
+                    self.file_finished.emit(base_name, 0)
+                    continue
+
+                results = _clean_extracted_rows(results, self.headers)
+                for row in results:
+                    self.row_extracted.emit(row)
+                self.file_finished.emit(base_name, len(results))
+
         except Exception as e:
-            self.error.emit(str(e))
-        self.all_finished.emit()
+            self.error.emit(f"Extraction failed: {str(e)}")
+        finally:
+            self.all_finished.emit()
+
+    def _ocr_image(self, image) -> str:
+        try:
+            import pytesseract as tess  # type: ignore
+        except ImportError:
+            return ""
+        try:
+            return tess.image_to_string(image, lang="tam+eng", config="--psm 3")
+        except Exception:
+            try:
+                return tess.image_to_string(image, config="--psm 3")
+            except Exception:
+                return ""
 
 
 class PetitionWidget(QWidget):
@@ -1823,16 +1899,41 @@ class PetitionWidget(QWidget):
     def __init__(self, spreadsheet: SpreadsheetWidget, parent=None):
         super().__init__(parent)
         self.spreadsheet = spreadsheet
-        self.model_name = "gemma3:12b"
+        self.model_name = "qwen2.5vl:7b"
+        self.engine_name = "local"
+        self._local_model_name = self.model_name
+        self._gemini_model_name = DEFAULT_GEMINI_MODEL
         self.current_prompt = DEFAULT_PETITION_PROMPT
         self._thread = None
+        self._active_headers: list[str] = []
+        self._cloud_version_col: int | None = None
+        self._queued_files = 0
+        self._finished_files = 0
+        self._rows_extracted = 0
+        self._skipped_files = 0
         self.setAcceptDrops(True)
 
         # Controls
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("Local Ollama", "local")
+        self.engine_combo.addItem("Cloud Gemini", "gemini")
+        self.engine_combo.currentIndexChanged.connect(self._apply_engine_combo)
+
         model_combo = QComboBox()
         for label, val in VISION_MODEL_PRESETS:
             model_combo.addItem(label, val)
-        model_combo.currentIndexChanged.connect(lambda: setattr(self, 'model_name', model_combo.currentData() or 'gemma3:12b'))
+        model_combo.currentIndexChanged.connect(lambda: self._apply_model_combo(model_combo))
+        self.model_combo = model_combo
+        self.model_input = QLineEdit(self.model_name)
+        self.model_input.setPlaceholderText("Ollama model tag")
+        self.model_input.textChanged.connect(self._model_text_changed)
+
+        self.gemini_key_label = QLabel("Gemini key:")
+        self.gemini_key = QLineEdit(os.environ.get("GEMINI_API_KEY", ""))
+        self.gemini_key.setPlaceholderText("GEMINI_API_KEY")
+        self.gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_key_label.hide()
+        self.gemini_key.hide()
 
         btn_load = QPushButton("📄 Load Petitions")
         btn_load.clicked.connect(self.load_files)
@@ -1850,26 +1951,83 @@ class PetitionWidget(QWidget):
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setTextVisible(True)
+        self.progress.setFormat("%v / %m files")
 
         self.status = QLabel("✦ Drop PDF/image files or click Load")
         self.status.setStyleSheet("color: #1e40af; font-weight: 600; font-size: 13px; padding: 4px;")
+        self.stats = QLabel("")
+        self.stats.setStyleSheet(
+            "background: #eef6ff; color: #0f172a; border: 1px solid #bfdbfe; "
+            "border-radius: 8px; padding: 8px 10px; font-weight: 600;"
+        )
+        self._update_stats()
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("Extraction log...")
+        self.log.setStyleSheet(
+            "QTextEdit { background: #0f172a; color: #dbeafe; border: 1px solid #1e293b; "
+            "border-radius: 10px; padding: 10px; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 12px; }"
+        )
 
         controls = QHBoxLayout()
+        controls.addWidget(QLabel("Engine:"))
+        controls.addWidget(self.engine_combo)
         controls.addWidget(btn_load)
         controls.addWidget(btn_set_headers)
         controls.addWidget(btn_prompt)
         controls.addWidget(QLabel("Model:"))
         controls.addWidget(model_combo, 1)
+        controls.addWidget(self.model_input, 1)
+        controls.addWidget(self.gemini_key_label)
+        controls.addWidget(self.gemini_key, 1)
 
         layout = QVBoxLayout(self)
         layout.addLayout(controls)
         layout.addWidget(self.status)
+        layout.addWidget(self.stats)
         layout.addWidget(self.progress)
         layout.addWidget(self.log, 1)
+
+    def _apply_model_combo(self, model_combo: QComboBox) -> None:
+        model = str(model_combo.currentData() or "gemma3:12b")
+        self.model_input.setText(model)
+
+    def _apply_engine_combo(self) -> None:
+        engine = str(self.engine_combo.currentData() or "local")
+        self.engine_name = engine
+        if engine == "gemini":
+            self._local_model_name = self.model_input.text().strip() or self._local_model_name
+            self.model_combo.setEnabled(False)
+            self.model_input.setPlaceholderText("Gemini model")
+            self.model_input.setText(self._gemini_model_name)
+            self.gemini_key_label.show()
+            self.gemini_key.show()
+            self.status.setText(f"Cloud Gemini ready: {self._gemini_model_name}")
+        else:
+            self._gemini_model_name = self.model_input.text().strip() or self._gemini_model_name
+            self.model_combo.setEnabled(True)
+            self.model_input.setPlaceholderText("Ollama model tag")
+            self.model_input.setText(self._local_model_name)
+            self.gemini_key_label.hide()
+            self.gemini_key.hide()
+            self.status.setText("Local Ollama ready")
+
+    def _model_text_changed(self, text: str) -> None:
+        model = text.strip()
+        if self.engine_name == "gemini":
+            self._gemini_model_name = model or DEFAULT_GEMINI_MODEL
+            self.model_name = self._gemini_model_name
+        else:
+            self._local_model_name = model or "gemma3:12b"
+            self.model_name = self._local_model_name
+
+    def _update_stats(self) -> None:
+        remaining = max(0, self._queued_files - self._finished_files)
+        self.stats.setText(
+            f"Queued: {self._queued_files}    Done: {self._finished_files}    "
+            f"Rows: {self._rows_extracted}    Needs review: {self._skipped_files}    Remaining: {remaining}"
+        )
 
     def _set_default_headers(self):
         for col, name in enumerate(DEFAULT_PETITION_HEADERS):
@@ -1882,12 +2040,28 @@ class PetitionWidget(QWidget):
         headers = []
         for col in range(200):
             val = self.spreadsheet.raw_values.get((0, col), "").strip()
-            if val:
+            if val and val != CLOUD_VERSION_COLUMN:
                 headers.append(val)
         return headers
 
+    def _ensure_cloud_version_column(self) -> int:
+        for col in range(self.spreadsheet.table.columnCount()):
+            if self.spreadsheet.raw_values.get((0, col), "").strip() == CLOUD_VERSION_COLUMN:
+                self._cloud_version_col = col
+                return col
+        col = 0
+        while col < self.spreadsheet.table.columnCount() and self.spreadsheet.raw_values.get((0, col), "").strip():
+            col += 1
+        while col >= self.spreadsheet.table.columnCount():
+            self.spreadsheet.add_column()
+        self.spreadsheet.raw_values[(0, col)] = CLOUD_VERSION_COLUMN
+        self.spreadsheet.recalculate()
+        self.spreadsheet._mark_changed()
+        self._cloud_version_col = col
+        return col
+
     def load_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select Petitions", "", "Documents (*.pdf *.png *.jpg *.jpeg)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Petitions", "", supported_file_filter())
         if paths:
             self._start_extraction(paths)
 
@@ -1896,23 +2070,54 @@ class PetitionWidget(QWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+        paths = existing_supported(url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile())
         if paths:
             self._start_extraction(paths)
 
     def _start_extraction(self, paths):
+        paths = existing_supported(paths)
+        if not paths:
+            QMessageBox.warning(self, "No supported files", "Drop or select PDF/image files.")
+            return
         headers = self._get_headers()
         if not headers:
             self._set_default_headers()
             headers = DEFAULT_PETITION_HEADERS
+        self._active_headers = list(headers)
+        engine = str(self.engine_combo.currentData() or "local")
+        model_name = self.model_input.text().strip() or (DEFAULT_GEMINI_MODEL if engine == "gemini" else self.model_name)
+        gemini_key = self.gemini_key.text().strip()
+        if engine == "gemini":
+            if not gemini_key and not os.environ.get("GEMINI_API_KEY"):
+                QMessageBox.warning(self, "Gemini API key needed", "Enter a Gemini API key or set GEMINI_API_KEY.")
+                return
+            self._ensure_cloud_version_column()
         self._btn_load.setEnabled(False)
+        self._queued_files = len(paths)
+        self._finished_files = 0
+        self._rows_extracted = 0
+        self._skipped_files = 0
+        self._update_stats()
         self.progress.setMaximum(len(paths))
         self.progress.setValue(0)
         self.progress.setVisible(True)
+        self.status.setStyleSheet("color: #1e40af; font-weight: 600; font-size: 13px; padding: 4px;")
         self.log.append(f"\n{'─' * 40}\n🔄 Extracting {len(paths)} file(s)...\n")
-        self._thread = PetitionThread(paths, headers, self.current_prompt, self.model_name)
+        label = f"Cloud Gemini ({model_name})" if engine == "gemini" else f"Local Ollama ({model_name})"
+        self.log.append(f"Engine: {label}")
+        self._thread = PetitionThread(
+            paths,
+            headers,
+            self.current_prompt,
+            model_name,
+            host=self.spreadsheet.window().chat.host.text(),
+            engine=engine,
+            gemini_api_key=gemini_key,
+        )
         self._thread.progress.connect(self._on_progress)
         self._thread.row_extracted.connect(self._on_row)
+        self._thread.file_finished.connect(self._on_file_finished)
+        self._thread.file_warning.connect(self._on_warning)
         self._thread.error.connect(self._on_error)
         self._thread.all_finished.connect(self._on_done)
         self._thread.start()
@@ -1922,15 +2127,34 @@ class PetitionWidget(QWidget):
         self.progress.setValue(cur)
 
     def _on_row(self, data):
-        headers = self._get_headers()
+        headers = self._active_headers or self._get_headers()
+        if not any(_is_meaningful_extracted_value(data.get(header, "")) for header in headers):
+            return
         row = self.spreadsheet._next_empty_row()
         for col, h in enumerate(headers):
             val = str(data.get(h, ""))
-            if val and val != "Not Specified":
+            if _is_meaningful_extracted_value(val):
                 self.spreadsheet.raw_values[(row, col)] = val
+        if self.engine_name == "gemini":
+            cloud_col = self._cloud_version_col if self._cloud_version_col is not None else self._ensure_cloud_version_column()
+            self.spreadsheet.raw_values[(row, cloud_col)] = self._gemini_model_name
         self.spreadsheet.recalculate()
         self.spreadsheet._mark_changed()
+        self._rows_extracted += 1
+        self._update_stats()
         self.log.append(f"✅ Row {row + 1} extracted")
+
+    def _on_file_finished(self, file_name: str, row_count: int):
+        self._finished_files += 1
+        if row_count == 0:
+            self._skipped_files += 1
+            self.log.append(f"⚠ No row found: {file_name}")
+        else:
+            self.log.append(f"✓ {file_name}: {row_count} row(s)")
+        self._update_stats()
+
+    def _on_warning(self, msg):
+        self.log.append(f"⚠ {msg}")
 
     def _on_error(self, msg):
         self.log.append(f"❌ {msg}")
@@ -1938,7 +2162,7 @@ class PetitionWidget(QWidget):
     def _on_done(self):
         self._btn_load.setEnabled(True)
         self.progress.setVisible(False)
-        self.status.setText("✅ Extraction complete")
+        self.status.setText(f"✅ Extraction complete: {self._rows_extracted} row(s), {self._skipped_files} file(s) need review")
         self.status.setStyleSheet("color: #059669; font-weight: 600; font-size: 13px; padding: 4px;")
         self.log.append(f"✅ Done.\n{'─' * 40}\n")
 
@@ -2109,6 +2333,7 @@ def item_to_style(item: QTableWidgetItem | None) -> dict[str, object]:
         "bold": font.bold(),
         "italic": font.italic(),
         "underline": font.underline(),
+        "family": font.family(),
         "foreground": qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None,
         "background": qcolor_to_rgb(background.color()) if background.style() != Qt.BrushStyle.NoBrush else None,
         "alignment": int(item.textAlignment()),
@@ -2119,6 +2344,8 @@ def apply_item_style(item: QTableWidgetItem, style: object) -> None:
     if not isinstance(style, dict):
         return
     font = item.font()
+    if style.get("family"):
+        font.setFamily(str(style.get("family")))
     font.setBold(bool(style.get("bold")))
     font.setItalic(bool(style.get("italic")))
     font.setUnderline(bool(style.get("underline")))

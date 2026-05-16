@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -11,6 +13,8 @@ from PIL import Image
 
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
+
+DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
 
 try:
     import pytesseract  # type: ignore
@@ -25,7 +29,7 @@ except ImportError:
 @dataclass
 class OllamaClient:
     host: str = "http://localhost:11434"
-    vision_model: str = "gemma3:12b"
+    vision_model: str = "qwen2.5vl:7b"
     chat_model: str = "gemma3:12b"
     embed_model: str = "nomic-embed-text"
     language_hint: str = "Tamil and English"
@@ -63,7 +67,13 @@ class OllamaClient:
     def is_model_available(self, model: str) -> bool:
         """Check if a specific model is available in Ollama."""
         models = self.list_models()
-        return any(model in m for m in models)
+        normalized = _normalize_key(model)
+        return any(model == m or normalized in _normalize_key(m) for m in models)
+
+    def is_vision_model(self, model: str | None = None) -> bool:
+        """Heuristic to check if a model name suggests vision capabilities."""
+        m = (model or self.vision_model).lower()
+        return any(keyword in m for keyword in ["vl", "vision", "llava", "pixtral", "moondream", "minicpm"])
 
     def generate(
         self,
@@ -169,6 +179,28 @@ class OllamaClient:
         system = "You are a local AI assistant. Answer clearly in Tamil or English based on the user's language."
         return self.generate(prompt, model=self.chat_model, system=system)
 
+    def extract_flexible(self, headers: list[str], *, images: list[Image.Image] | None = None, text: str | None = None, instruction: str | None = None) -> list[dict[str, str]]:
+        """Extract data into a JSON list based on headers, using either vision (images) or OCR text."""
+        headers_json = json.dumps({h: "" for h in headers}, ensure_ascii=False)
+        default_inst = (
+            "Extract structured data from this document. Understand the context and find values for each field. "
+            "The document may contain Tamil and English. Preserve Tamil script exactly as Unicode Tamil.\n"
+            "Return a JSON array of objects, where each object represents one entry/entity found in the document."
+        )
+        prompt = (
+            f"{instruction or default_inst}\n\n"
+            f"Use exactly these JSON keys: {headers_json}\n"
+            "If a value is not found, use \"Not Specified\".\n"
+            "Return ONLY a raw JSON array, with no markdown formatting if possible."
+        )
+        if text:
+            prompt += f"\n\nDocument Text:\n{text}"
+
+        system = "You are a precise data extraction engine. Output must be valid JSON array only."
+        model = self.vision_model if images else self.chat_model
+        response = self.generate(prompt, model=model, images=images, json_mode=True, system=system)
+        return parse_json_rows(response, headers)
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         payload: dict[str, Any] = {
             "model": self.embed_model,
@@ -188,6 +220,122 @@ class OllamaClient:
             raise RuntimeError(f"Ollama embedding failed: {exc}") from exc
 
 
+@dataclass
+class GeminiClient:
+    api_key: str | None = None
+    model: str = DEFAULT_GEMINI_MODEL
+    language_hint: str = "Tamil and English"
+    timeout: int = 300
+    endpoint: str = "https://generativelanguage.googleapis.com/v1beta"
+
+    def _api_key(self) -> str:
+        key = (self.api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("Gemini API key is missing. Enter it in the Gemini key field or set GEMINI_API_KEY.")
+        return key
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        images: list[Image.Image] | None = None,
+        system: str | None = None,
+        schema: dict[str, Any] | None = None,
+    ) -> str:
+        parts: list[dict[str, Any]] = [{"text": prompt}]
+        for image in images or []:
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": image_to_base64_png(prepare_for_vision(image)),
+                    }
+                }
+            )
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"temperature": 0},
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if schema:
+            payload["generationConfig"]["response_mime_type"] = "application/json"
+            payload["generationConfig"]["response_schema"] = _gemini_rest_schema(schema)
+        return self._send_request(payload)
+
+    def _send_request(self, payload: dict[str, Any]) -> str:
+        url = f"{self.endpoint.rstrip('/')}/models/{self.model}:generateContent"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self._api_key(),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(detail)
+                detail = parsed.get("error", {}).get("message", detail)
+            except json.JSONDecodeError:
+                pass
+            raise RuntimeError(f"Gemini API error: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach Gemini API: {exc}") from exc
+
+        texts: list[str] = []
+        for candidate in data.get("candidates", []):
+            content = candidate.get("content", {})
+            for part in content.get("parts", []):
+                if isinstance(part, dict) and part.get("text"):
+                    texts.append(str(part.get("text")))
+        if texts:
+            return "\n".join(texts).strip()
+        if data.get("promptFeedback"):
+            raise RuntimeError(f"Gemini returned no text. Feedback: {data.get('promptFeedback')}")
+        return ""
+
+    def extract_flexible(
+        self,
+        headers: list[str],
+        *,
+        images: list[Image.Image] | None = None,
+        text: str | None = None,
+        instruction: str | None = None,
+    ) -> list[dict[str, str]]:
+        headers_json = json.dumps(headers, ensure_ascii=False)
+        prompt = (
+            f"{instruction or 'Extract structured data from this document.'}\n\n"
+            f"Use exactly these JSON keys in every row, in this order: {headers_json}\n"
+            "Extract one row per distinct petitioner/entity. Preserve Tamil script exactly as Unicode Tamil. "
+            "For missing values, return an empty string. Do not invent values."
+        )
+        if text:
+            prompt += f"\n\nDocument Text:\n{text}"
+        schema = {
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {header: {"type": "string"} for header in headers},
+                        "required": headers,
+                    },
+                }
+            },
+            "required": ["rows"],
+        }
+        system = "You are a precise Tamil-English legal and financial document extraction engine. Output valid JSON only."
+        response = self.generate(prompt, images=images, system=system, schema=schema)
+        return parse_json_rows(response, headers)
+
+
 def _error_hint(detail: str, code: int) -> str:
     """Provide actionable hints based on common Ollama errors."""
     lower = detail.lower()
@@ -195,9 +343,33 @@ def _error_hint(detail: str, code: int) -> str:
         return "The model may not be downloaded yet. Run: `ollama pull <model-name>`"
     if "out of memory" in lower or "oom" in lower:
         return "The model is too large for your GPU. Try a smaller model or increase VRAM."
+    if "missing data required for image input" in lower or "does not support images" in lower:
+        return "The selected model does not support vision (images). Try switching to a vision model like `qwen2.5vl` or `llama3.2-vision`."
     if code == 500:
-        return "Internal Ollama error. Try restarting Ollama: `ollama serve`"
+        return "Internal Ollama error. Try restarting Ollama: `ollama serve` or check if the model supports vision inputs."
     return "Check Ollama logs for more details."
+
+
+def _gemini_rest_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    converted: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, str):
+            converted[key] = value.upper()
+        elif key in {"properties", "$defs", "defs"} and isinstance(value, dict):
+            converted[key] = {
+                str(prop_name): _gemini_rest_schema(prop_schema)
+                for prop_name, prop_schema in value.items()
+                if isinstance(prop_schema, dict)
+            }
+        elif key == "items" and isinstance(value, dict):
+            converted[key] = _gemini_rest_schema(value)
+        elif isinstance(value, dict):
+            converted[key] = _gemini_rest_schema(value)
+        elif isinstance(value, list):
+            converted[key] = [_gemini_rest_schema(item) if isinstance(item, dict) else item for item in value]
+        else:
+            converted[key] = value
+    return converted
 
 
 def ocr_crop(crop: Image.Image) -> str:
@@ -217,21 +389,16 @@ def ocr_crop(crop: Image.Image) -> str:
 
 
 def parse_json_rows(text: str, fields: list[str]) -> list[dict[str, str]]:
+    if not text or not text.strip():
+        return []
     payload = _extract_json_payload(text)
     if payload is None:
         return []
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
+    data = _loads_json_loose(payload)
+    if data is None:
         return []
-    if isinstance(data, dict):
-        for key in ("rows", "data", "table"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-        else:
-            data = [data]
-    if not isinstance(data, list):
+    data = _coerce_json_rows(data)
+    if data is None:
         return []
 
     normalized: list[dict[str, str]] = []
@@ -243,17 +410,19 @@ def parse_json_rows(text: str, fields: list[str]) -> list[dict[str, str]]:
         for field_item in fields:
             value = row.get(field_item, "")
             if value == "":
-                matched_key = key_lookup.get(_normalize_key(field_item))
+                matched_key = _match_json_key(field_item, key_lookup)
                 value = row.get(matched_key, "") if matched_key is not None else ""
             if value is None:
                 value = ""
-            values[field_item] = str(value).strip()
-        if any(values.values()):
+            values[field_item] = _stringify_cell_value(value)
+        if any(_is_meaningful_cell_value(value) for value in values.values()):
             normalized.append(values)
     return normalized
 
 
 def _extract_json_payload(text: str) -> str | None:
+    if not text:
+        return None
     stripped = text.strip()
     if not stripped:
         return None
@@ -268,6 +437,15 @@ def _extract_json_payload(text: str) -> str | None:
         return stripped
     if stripped.startswith("{") and stripped.endswith("}"):
         return stripped
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(stripped):
+        if char not in "[{":
+            continue
+        try:
+            _data, end = decoder.raw_decode(stripped[start:])
+        except json.JSONDecodeError:
+            continue
+        return stripped[start : start + end]
     start_array = stripped.find("[")
     end_array = stripped.rfind("]")
     if start_array >= 0 and end_array > start_array:
@@ -277,6 +455,89 @@ def _extract_json_payload(text: str) -> str | None:
     if start_obj >= 0 and end_obj > start_obj:
         return stripped[start_obj : end_obj + 1]
     return None
+
+
+def _loads_json_loose(payload: str) -> Any | None:
+    candidates = [payload, _remove_trailing_json_commas(payload)]
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _remove_trailing_json_commas(payload: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", payload)
+
+
+def _coerce_json_rows(data: Any) -> list[Any] | None:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("rows", "data", "table", "records", "items", "entries", "documents", "petitions", "results", "result"):
+            if key in data:
+                rows = _coerce_json_rows(data[key])
+                if rows is not None:
+                    return rows
+        return [data]
+    return None
+
+
+def _match_json_key(field: str, key_lookup: dict[str, str]) -> str | None:
+    normalized = _normalize_key(field)
+    if normalized in key_lookup:
+        return key_lookup[normalized]
+    for alias in _field_aliases(normalized):
+        if alias in key_lookup:
+            return key_lookup[alias]
+    fuzzy_matches = [
+        original
+        for key, original in key_lookup.items()
+        if key and normalized and (key in normalized or normalized in key or any(alias in key for alias in _field_aliases(normalized)))
+    ]
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0]
+    return None
+
+
+def _field_aliases(normalized_field: str) -> list[str]:
+    aliases: list[str] = []
+    if any(marker in normalized_field for marker in ("mobile", "phone", "contact")):
+        aliases.extend(["mobile", "mobileno", "phonenumber", "phone", "contact", "contactnumber"])
+    if "sender" in normalized_field:
+        aliases.extend(["sender", "sendername", "senderaddress", "fromaddress"])
+    if any(marker in normalized_field for marker in ("petitioner", "complainant", "applicant")):
+        aliases.extend(["petitioner", "petitionername", "complainant", "applicant", "nameaddress"])
+    if any(marker in normalized_field for marker in ("crime", "fir")):
+        aliases.extend(["crimeno", "crimenumber", "firno", "firnumber"])
+    if "id" in normalized_field:
+        aliases.extend(["id", "idno", "idnumber", "aadhar", "aadhaar", "pan"])
+    if any(marker in normalized_field for marker in ("plan", "scheme")):
+        aliases.extend(["plan", "planname", "scheme", "schemename"])
+    if "agent" in normalized_field:
+        aliases.append("agent")
+    if "statement" in normalized_field:
+        aliases.extend(["statement", "161statement"])
+    return aliases
+
+
+def _stringify_cell_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [_stringify_cell_value(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _is_meaningful_cell_value(value: str) -> bool:
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() not in {"not specified", "not found", "n/a", "na", "none", "null", "-", "--"}
 
 
 def _normalize_key(value: str) -> str:
