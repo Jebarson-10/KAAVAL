@@ -9,7 +9,6 @@ from typing import Any
 
 from PIL import Image
 
-from bamini import convert_rows_to_bamini, unicode_to_bamini
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
 
@@ -127,8 +126,7 @@ class OllamaClient:
             "If the crop is blank or unreadable, return an empty response."
         )
         system = "You are a careful OCR and document-table extraction model for Tamil and English legal/finance documents."
-        result = self.generate(prompt, model=self.vision_model, images=[crop], system=system)
-        return unicode_to_bamini(result)
+        return self.generate(prompt, model=self.vision_model, images=[crop], system=system)
 
     def extract_table_rows(self, template: ExtractionTemplate, image: Image.Image) -> list[dict[str, str]]:
         fields_json = json.dumps(template.field_names(), ensure_ascii=False)
@@ -146,8 +144,7 @@ class OllamaClient:
         )
         system = "You are a precise Tamil-English OCR engine. Your output must be valid JSON only."
         response = self.generate(prompt, model=self.vision_model, images=[image], json_mode=True, system=system)
-        rows = parse_json_rows(response, template.field_names())
-        return convert_rows_to_bamini(rows)
+        return parse_json_rows(response, template.field_names())
 
     def chat(self, prompt: str) -> str:
         system = "You are a local spreadsheet assistant. Answer clearly in Tamil or English based on the user's language."
@@ -167,7 +164,7 @@ def ocr_crop(crop: Image.Image) -> str:
         except Exception:
             return ""
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-    return unicode_to_bamini("\n".join(lines))
+    return "\n".join(lines)
 
 
 def parse_json_rows(text: str, fields: list[str]) -> list[dict[str, str]]:

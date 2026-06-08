@@ -6,9 +6,10 @@ LIGHT_STYLESHEET = """
 QWidget {
     background-color: #f8fafc;
     color: #1e293b;
-    font-family: "Segoe UI", "Inter", system-ui, sans-serif;
+    font-family: "Bamini TAMIL", "Bamini", "Segoe UI", "Inter", system-ui, sans-serif;
     font-size: 13px;
 }
+
 QMainWindow { background-color: #f1f5f9; }
 
 /* ── Tab Widget ── */
@@ -393,11 +394,9 @@ def style_sidebar_button(button, tone: str) -> None:
         "  border: 1px solid #e2e8f0;"
         "}"
     )
-
-
 CHAT_CSS = """
 <style>
-body { font-family: 'Segoe UI', sans-serif; background: #ffffff; color: #1e293b; }
+body { font-family: 'Bamini TAMIL', 'Bamini', 'Segoe UI', sans-serif; background: #ffffff; color: #1e293b; }
 .user-msg {
     background: linear-gradient(135deg, #2563eb, #3b82f6);
     color: white; border-radius: 18px 18px 4px 18px;

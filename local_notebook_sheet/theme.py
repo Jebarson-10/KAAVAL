@@ -5,7 +5,7 @@ DARK_STYLESHEET = """
 QWidget {
     background-color: #0f1117;
     color: #e2e8f0;
-    font-family: "Segoe UI", "Inter", system-ui, sans-serif;
+    font-family: "Bamini TAMIL", "Bamini", "Segoe UI", "Inter", system-ui, sans-serif;
     font-size: 13px;
 }
 
@@ -395,7 +395,7 @@ TOOLBAR_ACTIONS = [
 
 CHAT_CSS = """
 <style>
-body { font-family: 'Segoe UI', sans-serif; background: #12141d; color: #e2e8f0; }
+body { font-family: 'Bamini TAMIL', 'Bamini', 'Segoe UI', sans-serif; background: #12141d; color: #e2e8f0; }
 .user-msg {
     background: linear-gradient(135deg, #4f46e5, #6366f1);
     color: white; border-radius: 16px 16px 4px 16px;

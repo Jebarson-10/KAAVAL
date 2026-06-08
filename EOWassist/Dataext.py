@@ -29,7 +29,7 @@ DARK_STYLESHEET = """
 QWidget {
     background-color: #0f1117;
     color: #e2e8f0;
-    font-family: "Segoe UI", system-ui, sans-serif;
+    font-family: "Bamini TAMIL", "Bamini", "Segoe UI", system-ui, sans-serif;
     font-size: 13px;
 }
 QMainWindow { background-color: #0f1117; }

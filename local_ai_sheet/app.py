@@ -86,7 +86,7 @@ class SpreadsheetWidget(QWidget):
         self.table.setHorizontalHeaderLabels([column_name(i) for i in range(26)])
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
-        self.table.setFont(QFont("BAMINI-Tamil14", 10))
+        self.table.setFont(QFont("Bamini TAMIL", 10))
         
         # Auto-resize rows when columns are resized to fit wrapped text
         self.table.horizontalHeader().sectionResized.connect(self.table.resizeRowsToContents)
@@ -146,6 +146,7 @@ class SpreadsheetWidget(QWidget):
             ("Add Column", self.add_column, "structure"),
             ("Undo", self.undo, "neutral"),
             ("Redo", self.redo, "neutral"),
+            ("To Bamini", self.encode_selected_to_bamini, "training"),
         ]
         for label, handler, tone in actions:
             button = QPushButton(label)
@@ -154,7 +155,7 @@ class SpreadsheetWidget(QWidget):
             layout.addWidget(button)
             
         self.font_combo = QFontComboBox()
-        self.font_combo.setCurrentFont(QFont("BAMINI-Tamil14"))
+        self.font_combo.setCurrentFont(QFont("Bamini TAMIL"))
         self.font_combo.setFixedWidth(160)
         self.font_combo.currentFontChanged.connect(self.apply_font)
         style_tool_button(self.font_combo, "format")
@@ -270,6 +271,22 @@ class SpreadsheetWidget(QWidget):
             f = item.font()
             f.setFamily(family)
             item.setFont(f)
+        self._mark_changed()
+
+    def encode_selected_to_bamini(self) -> None:
+        from bamini import unicode_to_bamini
+        self._updating = True
+        try:
+            for item in self.selected_items_or_cells():
+                row, col = item.row(), item.column()
+                old_text = self.raw_values.get((row, col), "")
+                if old_text:
+                    new_text = unicode_to_bamini(old_text)
+                    item.setText(new_text)
+                    self.raw_values[(row, col)] = new_text
+        finally:
+            self._updating = False
+        self.recalculate()
         self._mark_changed()
 
     def apply_text_color(self) -> None:
@@ -512,6 +529,7 @@ class SpreadsheetWidget(QWidget):
         return self.table.rowCount()
 
     def table_context_csv(self, max_rows: int = 60) -> str:
+        from bamini import bamini_to_unicode
         output = []
         headers = [self.table.horizontalHeaderItem(col).text() if self.table.horizontalHeaderItem(col) else column_name(col) for col in range(self.table.columnCount())]
         active_cols = self._active_columns()
@@ -521,7 +539,7 @@ class SpreadsheetWidget(QWidget):
         writer_buffer.append(",".join(csv_escape(headers[col]) for col in active_cols))
         rows_added = 0
         for row in range(self.table.rowCount()):
-            values = [self._display_value(row, col) for col in active_cols]
+            values = [bamini_to_unicode(self._display_value(row, col)) for col in active_cols]
             if not any(values):
                 continue
             writer_buffer.append(",".join(csv_escape(value) for value in values))
@@ -703,7 +721,7 @@ class SpreadsheetWidget(QWidget):
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
             c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
-            c.font = Font(name="BAMINI-Tamil14", bold=True)
+            c.font = Font(name="Bamini TAMIL", bold=True)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -1137,7 +1155,12 @@ class ChatPanel(QWidget):
         self.message.clear()
         self.history.append(("User", question))
         self.chat_view.append(f"<b>You:</b> {escape_html(question)}")
-        prompt = build_chat_prompt(self.spreadsheet.table_context_csv(), self.history, question)
+
+        from bamini import bamini_to_unicode, unicode_to_bamini
+        unicode_question = bamini_to_unicode(question)
+        unicode_history = [(role, bamini_to_unicode(content)) for role, content in self.history]
+        prompt = build_chat_prompt(self.spreadsheet.table_context_csv(), unicode_history, unicode_question)
+
         client = OllamaClient(host=self.host.text().strip(), chat_model=self.model.text().strip())
         try:
             answer = client.chat(prompt)

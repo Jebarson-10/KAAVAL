@@ -199,7 +199,7 @@ class SpreadsheetWidget(QWidget):
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
         self.table.horizontalHeader().sectionResized.connect(lambda: self.table.resizeRowsToContents())
-        self.table.setFont(QFont("BAMINI-Tamil14", 10))
+        self.table.setFont(QFont("Bamini TAMIL", 10))
 
         # Right-click context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -322,10 +322,12 @@ class SpreadsheetWidget(QWidget):
             ("⬅➕ Col", self.insert_column_left, "structure", None),
             ("❌ Row", self.delete_row, "danger", None),
             ("❌ Col", self.delete_column, "danger", None),
+            (None, None, None, None),
+            ("🔤 To Bamini", self.encode_selected_to_bamini, "training", None),
         ]
 
         self.font_combo = QFontComboBox()
-        self.font_combo.setCurrentFont(QFont("BAMINI-Tamil14"))
+        self.font_combo.setCurrentFont(QFont("Bamini TAMIL"))
         self.font_combo.setFixedWidth(180)
         self.font_combo.currentFontChanged.connect(self.apply_font)
         style_tool_button(self.font_combo, "format")
@@ -472,6 +474,22 @@ class SpreadsheetWidget(QWidget):
             f = item.font()
             f.setFamily(family)
             item.setFont(f)
+        self._mark_changed()
+
+    def encode_selected_to_bamini(self) -> None:
+        from bamini import unicode_to_bamini
+        self._updating = True
+        try:
+            for item in self.selected_items_or_cells():
+                row, col = item.row(), item.column()
+                old_text = self.raw_values.get((row, col), "")
+                if old_text:
+                    new_text = unicode_to_bamini(old_text)
+                    item.setText(new_text)
+                    self.raw_values[(row, col)] = new_text
+        finally:
+            self._updating = False
+        self.recalculate()
         self._mark_changed()
 
     def apply_text_color(self) -> None:
@@ -962,6 +980,7 @@ class SpreadsheetWidget(QWidget):
         return self.table.rowCount()
 
     def table_context_csv(self, max_rows: int = 60) -> str:
+        from bamini import bamini_to_unicode
         output = []
         headers = [self.table.horizontalHeaderItem(col).text() if self.table.horizontalHeaderItem(col) else column_name(col) for col in range(self.table.columnCount())]
         active_cols = self._active_columns()
@@ -971,7 +990,7 @@ class SpreadsheetWidget(QWidget):
         writer_buffer.append(",".join(csv_escape(headers[col]) for col in active_cols))
         rows_added = 0
         for row in range(self.table.rowCount()):
-            values = [self._display_value(row, col) for col in active_cols]
+            values = [bamini_to_unicode(self._display_value(row, col)) for col in active_cols]
             if not any(values):
                 continue
             writer_buffer.append(",".join(csv_escape(value) for value in values))
@@ -1153,7 +1172,7 @@ class SpreadsheetWidget(QWidget):
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
             c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
-            c.font = Font(name="BAMINI-Tamil14", bold=True)
+            c.font = Font(name="Bamini TAMIL", bold=True)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -1703,7 +1722,9 @@ class ChatPanel(QWidget):
         rag_context = ""
         self._pending_citations = []
         try:
-            chunks = self.rag.search(question, n_results=5)
+            from bamini import bamini_to_unicode
+            unicode_question = bamini_to_unicode(question)
+            chunks = self.rag.search(unicode_question, n_results=5)
             if chunks:
                 lines = []
                 for idx, c in enumerate(chunks, start=1):
@@ -1747,6 +1768,7 @@ class ChatPanel(QWidget):
         self.chat_view.setHtml(CHAT_CSS + '<div class="clear"></div>')
 
     def build_prompt(self, table_context: str, rag_context: str, history: list[tuple[str, str]], question: str) -> str:
+        from bamini import bamini_to_unicode
         recent_history = history[-8:]
         lines = [
             "You are a local AI assistant. You have access to a structured spreadsheet and an unstructured knowledge base.",
@@ -1761,8 +1783,8 @@ class ChatPanel(QWidget):
             "Recent conversation:",
         ]
         for role, content in recent_history:
-            lines.append(f"{role}: {content}")
-        lines.extend(["", f"User: {question}", "Assistant:"])
+            lines.append(f"{role}: {bamini_to_unicode(content)}")
+        lines.extend(["", f"User: {bamini_to_unicode(question)}", "Assistant:"])
         return "\n".join(lines)
 
 

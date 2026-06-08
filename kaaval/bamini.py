@@ -393,6 +393,26 @@ def unicode_to_bamini(text: str) -> str:
     return result
 
 
+# Reverse mapping for Bamini → Unicode.
+# Sort by length of the Bamini sequence in descending order to avoid partial matches first.
+_BAMINI_TO_UNICODE: list[tuple[str, str]] = sorted(
+    [(bamini_seq, unicode_seq) for unicode_seq, bamini_seq in _UNICODE_TO_BAMINI],
+    key=lambda x: len(x[0]),
+    reverse=True
+)
+
+
+def bamini_to_unicode(text: str) -> str:
+    """Convert Bamini legacy font encoded text to Unicode Tamil."""
+    if not text:
+        return text
+
+    result = text
+    for bamini_seq, unicode_seq in _BAMINI_TO_UNICODE:
+        result = result.replace(bamini_seq, unicode_seq)
+    return result
+
+
 def convert_values_to_bamini(values: dict[str, str]) -> dict[str, str]:
     """Convert all Tamil Unicode values in an extraction row dict to Bamini."""
     return {key: unicode_to_bamini(val) for key, val in values.items()}
@@ -401,3 +421,4 @@ def convert_values_to_bamini(values: dict[str, str]) -> dict[str, str]:
 def convert_rows_to_bamini(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     """Convert all Tamil Unicode values in a list of extraction rows to Bamini."""
     return [convert_values_to_bamini(row) for row in rows]
+
