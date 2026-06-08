@@ -33,6 +33,8 @@ class OllamaEmbeddingFunction:
         self.client = client
     def __call__(self, input):
         return self.client.embed(list(input))
+    def name(self) -> str:
+        return "ollama_embedding_function"
 
 
 if not HAS_CHROMADB:

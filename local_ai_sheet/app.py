@@ -16,9 +16,9 @@ from PySide6.QtGui import QColor, QFont, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -41,12 +41,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ai import OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
-from .document import crop_normalized, page_count, render_page, supported_file_filter
-from .formula import FormulaEngine, column_name
-from .templates import APP_DIR, ExtractionTemplate, TemplateField, TemplateStore
-from .widgets import ImageSelectionCanvas
-from .theme import DARK_STYLESHEET, style_tool_button
+from ai import OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
+from document import crop_normalized, page_count, render_page, supported_file_filter
+from formula import FormulaEngine, column_name
+from templates import APP_DIR, ExtractionTemplate, TemplateField, TemplateStore
+from widgets import ImageSelectionCanvas
+from theme import DARK_STYLESHEET, style_tool_button
 
 
 NATIVE_FILE_FILTER = "Local AI Sheet (*.laisheet)"
@@ -54,11 +54,13 @@ AUTOSAVE_FILE = APP_DIR / "autosave.laisheet"
 MONEY_CHECK_COLUMN = "Money Check"
 
 VISION_MODEL_PRESETS = [
-    ("Gemma 3 12B - Tamil vision", "gemma3:12b"),
-    ("Gemma 4 E2B - lighter", "gemma4:e2b"),
-    ("Gemma 4 26B - stronger", "gemma4:26b"),
-    ("Gemma 4 31B - strongest", "gemma4:31b"),
-    ("Qwen 2.5 VL 7B", "qwen2.5vl:7b"),
+    ("Qwen 2.5 VL (Best for Tamil OCR)", "qwen2.5-vl"),
+    ("MiniCPM-V 2.6 (Fast & Accurate)", "minicpm-v"),
+    ("Llama 3.2 Vision (Strong Reasoning)", "llama3.2-vision"),
+    ("Gemma 3 12B (Tamil Reasoning Only)", "gemma3:12b"),
+    ("Gemma 4 E4B (Balanced)", "gemma4:e4b"),
+    ("Gemma 4 26B (Advanced)", "gemma4:26b"),
+    ("Gemma 4 31B (Strongest Reasoning)", "gemma4:31b"),
 ]
 
 
@@ -84,6 +86,7 @@ class SpreadsheetWidget(QWidget):
         self.table.setHorizontalHeaderLabels([column_name(i) for i in range(26)])
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
+        self.table.setFont(QFont("BAMINI-Tamil14", 10))
         
         # Auto-resize rows when columns are resized to fit wrapped text
         self.table.horizontalHeader().sectionResized.connect(self.table.resizeRowsToContents)
@@ -149,6 +152,14 @@ class SpreadsheetWidget(QWidget):
             button.clicked.connect(handler)
             style_tool_button(button, tone)
             layout.addWidget(button)
+            
+        self.font_combo = QFontComboBox()
+        self.font_combo.setCurrentFont(QFont("BAMINI-Tamil14"))
+        self.font_combo.setFixedWidth(160)
+        self.font_combo.currentFontChanged.connect(self.apply_font)
+        style_tool_button(self.font_combo, "format")
+        layout.addWidget(self.font_combo)
+
         layout.addStretch(1)
         return toolbar
 
@@ -251,6 +262,14 @@ class SpreadsheetWidget(QWidget):
             font = item.font()
             font.setUnderline(not font.underline())
             item.setFont(font)
+        self._mark_changed()
+
+    def apply_font(self, font: QFont) -> None:
+        family = font.family()
+        for item in self.selected_items_or_cells():
+            f = item.font()
+            f.setFamily(family)
+            item.setFont(f)
         self._mark_changed()
 
     def apply_text_color(self) -> None:
@@ -683,7 +702,8 @@ class SpreadsheetWidget(QWidget):
 
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
-            sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
+            c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
+            c.font = Font(name="BAMINI-Tamil14", bold=True)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -699,6 +719,7 @@ class SpreadsheetWidget(QWidget):
                     background = item.background()
                     font_color = qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None
                     cell.font = Font(
+                        name=font.family(),
                         bold=font.bold(),
                         italic=font.italic(),
                         underline="single" if font.underline() else None,
@@ -1190,6 +1211,7 @@ def item_to_style(item: QTableWidgetItem | None) -> dict[str, object]:
         "bold": font.bold(),
         "italic": font.italic(),
         "underline": font.underline(),
+        "family": font.family(),
         "foreground": qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None,
         "background": qcolor_to_rgb(background.color()) if background.style() != Qt.BrushStyle.NoBrush else None,
         "alignment": int(item.textAlignment()),
@@ -1200,6 +1222,8 @@ def apply_item_style(item: QTableWidgetItem, style: object) -> None:
     if not isinstance(style, dict):
         return
     font = item.font()
+    if style.get("family"):
+        font.setFamily(str(style.get("family")))
     font.setBold(bool(style.get("bold")))
     font.setItalic(bool(style.get("italic")))
     font.setUnderline(bool(style.get("underline")))

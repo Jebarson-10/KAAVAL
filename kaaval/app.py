@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -52,9 +53,18 @@ from PySide6.QtWidgets import (
 from ai import DEFAULT_GEMINI_MODEL, GeminiClient, OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
 from document import crop_normalized, existing_supported, page_count, render_page, supported_file_filter
 from formula import FormulaEngine, column_name
-from templates import APP_DIR, ExtractionTemplate, TemplateField, TemplateStore
+from templates import (
+    APP_DIR, ExtractionTemplate, TemplateField, TemplateStore,
+    FewShotStore, FewShotExample, FewShotTemplate,
+    load_settings, save_settings,
+)
 from widgets import ImageSelectionCanvas
-from theme import LIGHT_STYLESHEET, style_tool_button, CHAT_CSS
+from theme import (
+    LIGHT_STYLESHEET, style_tool_button, CHAT_CSS,
+    style_sidebar_button, SECTION_LABEL_STYLE, SIDEBAR_HEADER_STYLE,
+    PETITION_STATUS_STYLE, PETITION_STATUS_DONE_STYLE,
+    PETITION_STATS_STYLE, PETITION_LOG_STYLE,
+)
 
 try:
     import pytesseract  # type: ignore
@@ -189,7 +199,7 @@ class SpreadsheetWidget(QWidget):
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
         self.table.horizontalHeader().sectionResized.connect(lambda: self.table.resizeRowsToContents())
-        self.table.setFont(QFont("Nirmala UI", 10))
+        self.table.setFont(QFont("BAMINI-Tamil14", 10))
 
         # Right-click context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -315,7 +325,7 @@ class SpreadsheetWidget(QWidget):
         ]
 
         self.font_combo = QFontComboBox()
-        self.font_combo.setCurrentFont(QFont("Nirmala UI"))
+        self.font_combo.setCurrentFont(QFont("BAMINI-Tamil14"))
         self.font_combo.setFixedWidth(180)
         self.font_combo.currentFontChanged.connect(self.apply_font)
         style_tool_button(self.font_combo, "format")
@@ -340,14 +350,13 @@ class SpreadsheetWidget(QWidget):
         row1_layout.addStretch(1)
         row2_layout.addStretch(1)
 
-        # Tools dropdown button on Row 1
+        # Tools dropdown button on Row 1 — CHANGE 1: only 3 items
         tools_btn = QPushButton("⚙ Tools ▼")
         style_tool_button(tools_btn, "primary")
         tools_menu = QMenu(self)
         tools_menu.addAction("🛡 Petition Extractor", lambda: self._show_tool_panel("petition"))
-        tools_menu.addAction("📥 Vision Import", lambda: self._show_tool_panel("vision"))
-        tools_menu.addAction("📋 Template Editor", lambda: self._show_tool_panel("template"))
-        tools_menu.addAction("📚 Notebook / RAG", lambda: self._show_tool_panel("notebook"))
+        tools_menu.addAction("🤖 AI Chat", lambda: self._show_tool_panel("chat"))
+        tools_menu.addAction("🧠 AI Training", lambda: self._show_tool_panel("training"))
         tools_btn.setMenu(tools_menu)
         row1_layout.addWidget(tools_btn)
         
@@ -1144,7 +1153,7 @@ class SpreadsheetWidget(QWidget):
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
             c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
-            c.font = Font(name="Nirmala UI", bold=True)
+            c.font = Font(name="BAMINI-Tamil14", bold=True)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -1809,6 +1818,7 @@ class PetitionThread(QThread):
         host="http://localhost:11434",
         engine="local",
         gemini_api_key="",
+        fewshot_template=None,
     ):
         super().__init__()
         self.file_paths = file_paths
@@ -1818,6 +1828,7 @@ class PetitionThread(QThread):
         self.host = host
         self.engine = engine
         self.gemini_api_key = gemini_api_key
+        self.fewshot_template = fewshot_template
 
     def run(self):
         from PIL import Image as PILImage
@@ -1863,6 +1874,7 @@ class PetitionThread(QThread):
                         images=images if images else None,
                         text=text if text else None,
                         instruction=self.instruction,
+                        fewshot_template=self.fewshot_template,
                     )
                 except Exception as exc:
                     self.file_warning.emit(f"{base_name}: {exc}")
@@ -1871,6 +1883,7 @@ class PetitionThread(QThread):
 
                 results = _clean_extracted_rows(results, self.headers)
                 for row in results:
+                    row["_file_path"] = file_path
                     self.row_extracted.emit(row)
                 self.file_finished.emit(base_name, len(results))
 
@@ -1893,12 +1906,48 @@ class PetitionThread(QThread):
                 return ""
 
 
+class ModelComboBox(QComboBox):
+    textChanged = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.lineEdit().textChanged.connect(self.textChanged.emit)
+        self.currentIndexChanged.connect(self._on_index_changed)
+
+    def _on_index_changed(self, idx):
+        self.textChanged.emit(self.text())
+
+    def text(self) -> str:
+        idx = self.currentIndex()
+        if idx >= 0:
+            data = self.itemData(idx)
+            if data:
+                return str(data)
+        return self.currentText().strip()
+
+    def setText(self, val: str):
+        self.blockSignals(True)
+        idx = -1
+        for i in range(self.count()):
+            if self.itemData(i) == val:
+                idx = i
+                break
+        if idx >= 0:
+            self.setCurrentIndex(idx)
+        else:
+            self.setEditText(val)
+        self.blockSignals(False)
+        self.textChanged.emit(val)
+
+
 class PetitionWidget(QWidget):
     """Tamil Petition OCR+LLM extraction — merged from EOWassist."""
 
-    def __init__(self, spreadsheet: SpreadsheetWidget, parent=None):
+    def __init__(self, spreadsheet: SpreadsheetWidget, fewshot_store: FewShotStore, parent=None):
         super().__init__(parent)
         self.spreadsheet = spreadsheet
+        self.fewshot_store = fewshot_store
         self.model_name = "qwen2.5vl:7b"
         self.engine_name = "local"
         self._local_model_name = self.model_name
@@ -1913,81 +1962,214 @@ class PetitionWidget(QWidget):
         self._skipped_files = 0
         self.setAcceptDrops(True)
 
+        # CHANGE 3: Persist Gemini API Key — load saved key
+        settings = load_settings()
+        saved_key = settings.get('gemini_api_key', os.environ.get('GEMINI_API_KEY', ''))
+
         # Controls
         self.engine_combo = QComboBox()
+        self.engine_combo.setMinimumWidth(160)
         self.engine_combo.addItem("Local Ollama", "local")
         self.engine_combo.addItem("Cloud Gemini", "gemini")
         self.engine_combo.currentIndexChanged.connect(self._apply_engine_combo)
 
         model_combo = QComboBox()
+        model_combo.setMinimumWidth(160)
         for label, val in VISION_MODEL_PRESETS:
             model_combo.addItem(label, val)
         model_combo.currentIndexChanged.connect(lambda: self._apply_model_combo(model_combo))
         self.model_combo = model_combo
-        self.model_input = QLineEdit(self.model_name)
+        self.model_input = ModelComboBox()
+        self.model_input.setText(self.model_name)
         self.model_input.setPlaceholderText("Ollama model tag")
         self.model_input.textChanged.connect(self._model_text_changed)
 
         self.gemini_key_label = QLabel("Gemini key:")
-        self.gemini_key = QLineEdit(os.environ.get("GEMINI_API_KEY", ""))
+        self.gemini_key = QLineEdit(saved_key)
         self.gemini_key.setPlaceholderText("GEMINI_API_KEY")
         self.gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.gemini_key_label.hide()
         self.gemini_key.hide()
 
+        # CHANGE 5: FewShot template dropdown
+        self.fewshot_combo = QComboBox()
+        self.fewshot_combo.setMinimumWidth(160)
+        self.refresh_fewshot_templates()
+
         btn_load = QPushButton("📄 Load Petitions")
         btn_load.clicked.connect(self.load_files)
-        style_tool_button(btn_load, "primary")
+        style_sidebar_button(btn_load, "primary")
         self._btn_load = btn_load
 
         btn_prompt = QPushButton("✍ Edit Prompt")
         btn_prompt.clicked.connect(self.edit_prompt)
-        style_tool_button(btn_prompt, "neutral")
+        style_sidebar_button(btn_prompt, "neutral")
 
-        btn_set_headers = QPushButton("📋 Set Default Headers")
+        btn_set_headers = QPushButton("📋 Set Headers")
         btn_set_headers.clicked.connect(self._set_default_headers)
-        style_tool_button(btn_set_headers, "structure")
+        style_sidebar_button(btn_set_headers, "structure")
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setTextVisible(True)
         self.progress.setFormat("%v / %m files")
 
-        self.status = QLabel("✦ Drop PDF/image files or click Load")
-        self.status.setStyleSheet("color: #1e40af; font-weight: 600; font-size: 13px; padding: 4px;")
+        self.status = QLabel("🛡 KAAVAL — Drop PDF/image files or click Load to begin extraction")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(PETITION_STATUS_STYLE)
         self.stats = QLabel("")
-        self.stats.setStyleSheet(
-            "background: #eef6ff; color: #0f172a; border: 1px solid #bfdbfe; "
-            "border-radius: 8px; padding: 8px 10px; font-weight: 600;"
-        )
+        self.stats.setStyleSheet(PETITION_STATS_STYLE)
         self._update_stats()
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setPlaceholderText("Extraction log...")
-        self.log.setStyleSheet(
-            "QTextEdit { background: #0f172a; color: #dbeafe; border: 1px solid #1e293b; "
-            "border-radius: 10px; padding: 10px; font-family: 'Cascadia Mono', Consolas, monospace; font-size: 12px; }"
-        )
+        self.log.setPlaceholderText("Extraction log will appear here...")
+        self.log.setStyleSheet(PETITION_LOG_STYLE)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Engine:"))
-        controls.addWidget(self.engine_combo)
-        controls.addWidget(btn_load)
-        controls.addWidget(btn_set_headers)
-        controls.addWidget(btn_prompt)
-        controls.addWidget(QLabel("Model:"))
-        controls.addWidget(model_combo, 1)
-        controls.addWidget(self.model_input, 1)
-        controls.addWidget(self.gemini_key_label)
-        controls.addWidget(self.gemini_key, 1)
+        # CHANGE 6: Proper multi-row layout for controls
+        # Row 1: Engine + Load Petitions
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Engine:"))
+        row1.addWidget(self.engine_combo)
+        row1.addWidget(btn_load, 1)
+
+        # Row 2: Model preset + model input
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Model:"))
+        row2.addWidget(model_combo, 1)
+        row2.addWidget(self.model_input, 1)
+
+        # Row 3: Gemini key (hidden by default)
+        self.gemini_key_row = QHBoxLayout()
+        self.gemini_key_row.addWidget(self.gemini_key_label)
+        self.gemini_key_row.addWidget(self.gemini_key, 1)
+
+        # Row 4: Training template + Edit Prompt + Set Headers
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Training:"))
+        row4.addWidget(self.fewshot_combo, 1)
+        row4.addWidget(btn_prompt)
+        row4.addWidget(btn_set_headers)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(controls)
+        layout.setSpacing(6)
+        layout.addLayout(row1)
+        layout.addLayout(row2)
+        layout.addLayout(self.gemini_key_row)
+        layout.addLayout(row4)
         layout.addWidget(self.status)
         layout.addWidget(self.stats)
         layout.addWidget(self.progress)
         layout.addWidget(self.log, 1)
+
+        self.refresh_ollama_models()
+
+    def refresh_ollama_models(self):
+        """Fetch and populate all pulled Ollama models, highlighting those without vision support in red."""
+        if self.engine_name != "local":
+            return
+            
+        client = OllamaClient()
+        models = client.list_models()
+        
+        self.model_input.blockSignals(True)
+        curr_text = self.model_input.text()
+        self.model_input.clear()
+        
+        if not models:
+            # Fallback presets when offline or not loaded yet
+            presets = ["qwen2.5-vl", "minicpm-v", "llama3.2-vision", "gemma3:12b"]
+            for idx, m in enumerate(presets):
+                has_vision = client.is_vision_model(m)
+                if has_vision:
+                    label = f"👁 {m}"
+                    self.model_input.addItem(label, m)
+                else:
+                    label = f"❌ {m} (No Vision)"
+                    self.model_input.addItem(label, m)
+                    self.model_input.setItemData(idx, QColor("#ef4444"), Qt.ItemDataRole.ForegroundRole)
+        else:
+            for idx, m in enumerate(models):
+                has_vision = client.is_vision_model(m)
+                if has_vision:
+                    label = f"👁 {m}"
+                    self.model_input.addItem(label, m)
+                else:
+                    label = f"❌ {m} (No Vision)"
+                    self.model_input.addItem(label, m)
+                    # Color it red in the dropdown
+                    self.model_input.setItemData(idx, QColor("#ef4444"), Qt.ItemDataRole.ForegroundRole)
+                    
+        # Restore selection
+        if curr_text:
+            found = False
+            for i in range(self.model_input.count()):
+                if self.model_input.itemData(i) == curr_text:
+                    self.model_input.setCurrentIndex(i)
+                    found = True
+                    break
+            if not found:
+                self.model_input.setEditText(curr_text)
+        else:
+            self.model_input.setCurrentIndex(0)
+            
+        self.model_input.blockSignals(False)
+
+    def refresh_gemini_models(self):
+        """Fetch and populate all supported Gemini models in the dropdown."""
+        if self.engine_name != "gemini":
+            return
+            
+        self.model_input.blockSignals(True)
+        curr_text = self.model_input.text()
+        self.model_input.clear()
+        
+        gemini_presets = [
+            ("gemini-3.5-flash", "Gemini 3.5 Flash (Latest)"),
+            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite (Efficient)"),
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro (Advanced)"),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
+            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            ("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite"),
+            ("gemini-1.5-flash", "Gemini 1.5 Flash (Cheaper)"),
+            ("gemini-1.5-flash-8b", "Gemini 1.5 Flash 8B (Budget)"),
+            ("gemini-1.5-pro", "Gemini 1.5 Pro (Standard)"),
+        ]
+        
+        for idx, (m, label) in enumerate(gemini_presets):
+            # All these models have native vision support
+            display_label = f"👁 {label} [{m}]"
+            self.model_input.addItem(display_label, m)
+            
+        # Restore selection
+        if curr_text:
+            found = False
+            for i in range(self.model_input.count()):
+                if self.model_input.itemData(i) == curr_text:
+                    self.model_input.setCurrentIndex(i)
+                    found = True
+                    break
+            if not found:
+                self.model_input.setEditText(curr_text)
+        else:
+            # Default to gemini-3.5-flash
+            self.model_input.setCurrentIndex(0)
+            
+        self.model_input.blockSignals(False)
+
+    def refresh_fewshot_templates(self):
+        """Refresh the fewshot template dropdown."""
+        current = self.fewshot_combo.currentData()
+        self.fewshot_combo.blockSignals(True)
+        self.fewshot_combo.clear()
+        self.fewshot_combo.addItem("No training template", "")
+        for t in self.fewshot_store.all():
+            self.fewshot_combo.addItem(f"🧠 {t.name}", t.template_id)
+        if current:
+            idx = self.fewshot_combo.findData(current)
+            if idx >= 0:
+                self.fewshot_combo.setCurrentIndex(idx)
+        self.fewshot_combo.blockSignals(False)
 
     def _apply_model_combo(self, model_combo: QComboBox) -> None:
         model = str(model_combo.currentData() or "gemma3:12b")
@@ -1996,22 +2178,74 @@ class PetitionWidget(QWidget):
     def _apply_engine_combo(self) -> None:
         engine = str(self.engine_combo.currentData() or "local")
         self.engine_name = engine
+        
+        # Block signals on model_combo to prevent trigger loops while repopulating
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        
         if engine == "gemini":
             self._local_model_name = self.model_input.text().strip() or self._local_model_name
-            self.model_combo.setEnabled(False)
+            self.model_combo.setEnabled(True)
+            
+            gemini_combo_presets = [
+                ("Gemini 3.5 Flash (Latest)", "gemini-3.5-flash"),
+                ("Gemini 3.1 Flash-Lite", "gemini-3.1-flash-lite"),
+                ("Gemini 3.1 Pro", "gemini-3.1-pro-preview"),
+                ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+                ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+                ("Gemini 2.5 Flash-Lite", "gemini-2.5-flash-lite"),
+                ("Gemini 1.5 Flash (Cheaper)", "gemini-1.5-flash"),
+                ("Gemini 1.5 Pro (Standard)", "gemini-1.5-pro"),
+            ]
+            for label, val in gemini_combo_presets:
+                self.model_combo.addItem(label, val)
+                
             self.model_input.setPlaceholderText("Gemini model")
+            self.refresh_gemini_models()
             self.model_input.setText(self._gemini_model_name)
+            
+            # Synchronize preset dropdown
+            idx = -1
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == self._gemini_model_name:
+                    idx = i
+                    break
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            else:
+                self.model_combo.setCurrentIndex(0)
+                
             self.gemini_key_label.show()
             self.gemini_key.show()
             self.status.setText(f"Cloud Gemini ready: {self._gemini_model_name}")
         else:
             self._gemini_model_name = self.model_input.text().strip() or self._gemini_model_name
             self.model_combo.setEnabled(True)
+            
+            # Local presets
+            for label, val in VISION_MODEL_PRESETS:
+                self.model_combo.addItem(label, val)
+                
             self.model_input.setPlaceholderText("Ollama model tag")
+            self.refresh_ollama_models()
             self.model_input.setText(self._local_model_name)
+            
+            # Synchronize preset dropdown
+            idx = -1
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == self._local_model_name:
+                    idx = i
+                    break
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            else:
+                self.model_combo.setCurrentIndex(0)
+                
             self.gemini_key_label.hide()
             self.gemini_key.hide()
             self.status.setText("Local Ollama ready")
+            
+        self.model_combo.blockSignals(False)
 
     def _model_text_changed(self, text: str) -> None:
         model = text.strip()
@@ -2034,7 +2268,8 @@ class PetitionWidget(QWidget):
             self.spreadsheet.raw_values[(0, col)] = name
         self.spreadsheet.recalculate()
         self.spreadsheet._mark_changed()
-        self.log.append("✅ Default petition headers set in Row 1.\n")
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.log.append(f"[{ts}] ✅ Default petition headers set in Row 1.\n")
 
     def _get_headers(self) -> list[str]:
         headers = []
@@ -2075,6 +2310,11 @@ class PetitionWidget(QWidget):
             self._start_extraction(paths)
 
     def _start_extraction(self, paths):
+        # CHANGE 8: Prevent double-start
+        if self._thread is not None and self._thread.isRunning():
+            QMessageBox.warning(self, "Already Running", "An extraction is already in progress. Please wait for it to finish.")
+            return
+
         paths = existing_supported(paths)
         if not paths:
             QMessageBox.warning(self, "No supported files", "Drop or select PDF/image files.")
@@ -2087,11 +2327,29 @@ class PetitionWidget(QWidget):
         engine = str(self.engine_combo.currentData() or "local")
         model_name = self.model_input.text().strip() or (DEFAULT_GEMINI_MODEL if engine == "gemini" else self.model_name)
         gemini_key = self.gemini_key.text().strip()
+
+        # CHANGE 3: Save Gemini key if provided
+        if gemini_key:
+            save_settings({'gemini_api_key': gemini_key})
+
         if engine == "gemini":
             if not gemini_key and not os.environ.get("GEMINI_API_KEY"):
                 QMessageBox.warning(self, "Gemini API key needed", "Enter a Gemini API key or set GEMINI_API_KEY.")
                 return
             self._ensure_cloud_version_column()
+
+        # Initialize fallback structures and states
+        if not getattr(self, "_in_fallback", False):
+            self._fallback_paths = []
+            self._paths_map = {Path(p).name: p for p in paths}
+            self._file_to_rows = {}
+            self._fallback_allocated_rows = {}
+            self._in_fallback = False
+
+        # CHANGE 5: Get selected fewshot template
+        fewshot_tid = self.fewshot_combo.currentData()
+        fewshot_template = self.fewshot_store.get(fewshot_tid) if fewshot_tid else None
+
         self._btn_load.setEnabled(False)
         self._queued_files = len(paths)
         self._finished_files = 0
@@ -2101,18 +2359,31 @@ class PetitionWidget(QWidget):
         self.progress.setMaximum(len(paths))
         self.progress.setValue(0)
         self.progress.setVisible(True)
-        self.status.setStyleSheet("color: #1e40af; font-weight: 600; font-size: 13px; padding: 4px;")
-        self.log.append(f"\n{'─' * 40}\n🔄 Extracting {len(paths)} file(s)...\n")
+        self.status.setStyleSheet(PETITION_STATUS_STYLE)
+        ts = datetime.now().strftime('%H:%M:%S')
+        
+        prefix = "[Fallback] 🔄 " if getattr(self, "_in_fallback", False) else ""
+        self.log.append(f"\n{'─' * 40}\n[{ts}] {prefix}Extracting {len(paths)} file(s)...\n")
         label = f"Cloud Gemini ({model_name})" if engine == "gemini" else f"Local Ollama ({model_name})"
-        self.log.append(f"Engine: {label}")
+        self.log.append(f"[{ts}] Engine: {label}")
+        if fewshot_template:
+            self.log.append(f"[{ts}] Training template: {fewshot_template.name} ({len(fewshot_template.examples)} examples)")
+
+        # CHANGE 8: Safe host retrieval with try/except fallback
+        try:
+            host = self.spreadsheet.window().chat.host.text()
+        except Exception:
+            host = "http://localhost:11434"
+
         self._thread = PetitionThread(
             paths,
             headers,
             self.current_prompt,
             model_name,
-            host=self.spreadsheet.window().chat.host.text(),
+            host=host,
             engine=engine,
             gemini_api_key=gemini_key,
+            fewshot_template=fewshot_template,
         )
         self._thread.progress.connect(self._on_progress)
         self._thread.row_extracted.connect(self._on_row)
@@ -2130,41 +2401,217 @@ class PetitionWidget(QWidget):
         headers = self._active_headers or self._get_headers()
         if not any(_is_meaningful_extracted_value(data.get(header, "")) for header in headers):
             return
-        row = self.spreadsheet._next_empty_row()
+
+        file_path = data.get("_file_path")
+        allocated_row = None
+        if getattr(self, "_in_fallback", False) and file_path:
+            allocated_rows = getattr(self, "_fallback_allocated_rows", {}).get(file_path, [])
+            if allocated_rows:
+                allocated_row = allocated_rows.pop(0)
+
+        if allocated_row is not None:
+            row = allocated_row
+        else:
+            row = self.spreadsheet._next_empty_row()
+
         for col, h in enumerate(headers):
             val = str(data.get(h, ""))
             if _is_meaningful_extracted_value(val):
                 self.spreadsheet.raw_values[(row, col)] = val
-        if self.engine_name == "gemini":
+
+        if self.engine_name == "gemini" or getattr(self, "_in_fallback", False):
             cloud_col = self._cloud_version_col if self._cloud_version_col is not None else self._ensure_cloud_version_column()
-            self.spreadsheet.raw_values[(row, cloud_col)] = self._gemini_model_name
+            model_used = "gemini-3.1-flash-lite" if getattr(self, "_in_fallback", False) else self._gemini_model_name
+            self.spreadsheet.raw_values[(row, cloud_col)] = model_used
+
         self.spreadsheet.recalculate()
         self.spreadsheet._mark_changed()
         self._rows_extracted += 1
         self._update_stats()
-        self.log.append(f"✅ Row {row + 1} extracted")
+        ts = datetime.now().strftime('%H:%M:%S')
+        
+        prefix = "[Fallback] " if getattr(self, "_in_fallback", False) else ""
+        self.log.append(f"[{ts}] ✅ {prefix}Row {row + 1} extracted")
+
+        # Fallback tracking
+        if file_path:
+            if file_path not in self._file_to_rows:
+                self._file_to_rows[file_path] = []
+            if row not in self._file_to_rows[file_path]:
+                self._file_to_rows[file_path].append(row)
+
+            # Check if this row is unfilled or contains "no data found" / "no table found"
+            is_unfilled = False
+            for h in headers:
+                val = str(data.get(h, "")).strip().lower()
+                if "no data found" in val or "no table found" in val:
+                    is_unfilled = True
+                    break
+
+            # Also check if it has very few meaningful fields
+            meaningful_fields = 0
+            for h in headers:
+                val = data.get(h, "")
+                if _is_meaningful_extracted_value(val):
+                    meaningful_fields += 1
+            if meaningful_fields <= 2:
+                is_unfilled = True
+
+            if self.engine_name == "local" and not getattr(self, "_in_fallback", False) and is_unfilled:
+                if file_path not in self._fallback_paths:
+                    self._fallback_paths.append(file_path)
 
     def _on_file_finished(self, file_name: str, row_count: int):
         self._finished_files += 1
+        ts = datetime.now().strftime('%H:%M:%S')
         if row_count == 0:
             self._skipped_files += 1
-            self.log.append(f"⚠ No row found: {file_name}")
+            prefix = "[Fallback] " if getattr(self, "_in_fallback", False) else ""
+            self.log.append(f"[{ts}] ⚠ {prefix}No row found: {file_name}")
+
+            # Queue failed files for cloud fallback
+            file_path = self._paths_map.get(file_name)
+            if file_path:
+                if self.engine_name == "local" and not getattr(self, "_in_fallback", False):
+                    if file_path not in self._fallback_paths:
+                        self._fallback_paths.append(file_path)
+
+                    # Reserve placeholder row to maintain perfect ordering
+                    row = self.spreadsheet._next_empty_row()
+                    if file_path not in self._file_to_rows:
+                        self._file_to_rows[file_path] = []
+                    self._file_to_rows[file_path].append(row)
+
+                    headers = self._active_headers or self._get_headers()
+                    for col, h in enumerate(headers):
+                        if col == 0:
+                            val = f"[No data found in local model for {file_name}]"
+                        else:
+                            val = "[Pending Cloud Fallback]"
+                        self.spreadsheet.raw_values[(row, col)] = val
+
+                    self.spreadsheet.recalculate()
+                    self.spreadsheet._mark_changed()
+                elif getattr(self, "_in_fallback", False):
+                    # Gemini failed too! Let's update the pre-allocated placeholder with a permanent notice
+                    allocated_rows = getattr(self, "_fallback_allocated_rows", {}).get(file_path, [])
+                    for row in allocated_rows:
+                        headers = self._active_headers or self._get_headers()
+                        for col, h in enumerate(headers):
+                            if col == 0:
+                                val = f"[No data found by Cloud Gemini for {file_name}]"
+                            else:
+                                val = "[Failed in both models]"
+                            self.spreadsheet.raw_values[(row, col)] = val
+                    self.spreadsheet.recalculate()
+                    self.spreadsheet._mark_changed()
         else:
-            self.log.append(f"✓ {file_name}: {row_count} row(s)")
+            prefix = "[Fallback] " if getattr(self, "_in_fallback", False) else ""
+            self.log.append(f"[{ts}] ✓ {prefix}{file_name}: {row_count} row(s)")
         self._update_stats()
 
     def _on_warning(self, msg):
-        self.log.append(f"⚠ {msg}")
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.log.append(f"[{ts}] ⚠ {msg}")
 
     def _on_error(self, msg):
-        self.log.append(f"❌ {msg}")
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.log.append(f"[{ts}] ❌ {msg}")
 
     def _on_done(self):
+        ts = datetime.now().strftime('%H:%M:%S')
+        
+        # Check if cloud fallback is needed
+        if self.engine_name == "local" and not getattr(self, "_in_fallback", False) and getattr(self, "_fallback_paths", None):
+            gemini_key = self.gemini_key.text().strip() or os.environ.get("GEMINI_API_KEY") or load_settings().get('gemini_api_key', '')
+            if not gemini_key:
+                self.log.append(f"[{ts}] ⚠ Cloud fallback needed for {len(self._fallback_paths)} file(s), but no Gemini API key was found.")
+                self.log.append("Please enter a Gemini key or set GEMINI_API_KEY env variable to enable auto-fallback.\n")
+                
+                self._btn_load.setEnabled(True)
+                self.progress.setVisible(False)
+                self.status.setText(f"✅ Extraction complete: {self._rows_extracted} row(s), {self._skipped_files} file(s) need review")
+                self.status.setStyleSheet(PETITION_STATUS_DONE_STYLE)
+                self.log.append(f"[{ts}] ✅ Done.\n{'─' * 40}\n")
+                return
+
+            self._in_fallback = True
+            fallback_model = "gemini-3.1-flash-lite"
+
+            self.log.append(f"[{ts}] 🔄 [Fallback] Auto-switching to Cloud Gemini ({fallback_model}) to redo unfilled/failed files...")
+            self.log.append(f"[{ts}] [Fallback] Files to redo: {', '.join(Path(p).name for p in self._fallback_paths)}")
+
+            # Copy all pre-allocated and written rows to fallback allocation dictionary
+            self._fallback_allocated_rows = {k: list(v) for k, v in self._file_to_rows.items()}
+
+            # Clear old unfilled rows for these files in the spreadsheet
+            cleared_count = 0
+            for file_path in list(self._fallback_paths):
+                rows_to_clear = self._file_to_rows.get(file_path, [])
+                for r in rows_to_clear:
+                    for col in range(self.spreadsheet.table.columnCount()):
+                        self.spreadsheet.raw_values.pop((r, col), None)
+                    cleared_count += 1
+
+            if cleared_count > 0:
+                self.spreadsheet.recalculate()
+                self.spreadsheet._mark_changed()
+                self.log.append(f"[{ts}] [Fallback] Cleared {cleared_count} old unfilled row(s) in the spreadsheet.")
+
+            # Run the fallback thread
+            paths_to_run = list(self._fallback_paths)
+            self._fallback_paths = [] # Clear to prevent recursion
+
+            self._queued_files = len(paths_to_run)
+            self._finished_files = 0
+            self._rows_extracted = 0
+            self._skipped_files = 0
+            self._update_stats()
+            self.progress.setMaximum(len(paths_to_run))
+            self.progress.setValue(0)
+            self.progress.setVisible(True)
+            self.status.setText("Cloud fallback in progress...")
+
+            try:
+                host = self.spreadsheet.window().chat.host.text()
+            except Exception:
+                host = "http://localhost:11434"
+
+            self._ensure_cloud_version_column()
+
+            fewshot_tid = self.fewshot_combo.currentData()
+            fewshot_template = self.fewshot_store.get(fewshot_tid) if fewshot_tid else None
+
+            self._thread = PetitionThread(
+                paths_to_run,
+                self._active_headers,
+                self.current_prompt,
+                fallback_model,
+                host=host,
+                engine="gemini",
+                gemini_api_key=gemini_key,
+                fewshot_template=fewshot_template,
+            )
+            self._thread.progress.connect(self._on_progress)
+            self._thread.row_extracted.connect(self._on_row)
+            self._thread.file_finished.connect(self._on_file_finished)
+            self._thread.file_warning.connect(self._on_warning)
+            self._thread.error.connect(self._on_error)
+            self._thread.all_finished.connect(self._on_done)
+            self._thread.start()
+            return
+
+        # If we completed a fallback run, reset fallback status
+        is_fallback_run = getattr(self, "_in_fallback", False)
+        if is_fallback_run:
+            self._in_fallback = False
+            self.log.append(f"[{ts}] ✅ [Fallback] Cloud fallback run completed successfully.")
+
         self._btn_load.setEnabled(True)
         self.progress.setVisible(False)
         self.status.setText(f"✅ Extraction complete: {self._rows_extracted} row(s), {self._skipped_files} file(s) need review")
-        self.status.setStyleSheet("color: #059669; font-weight: 600; font-size: 13px; padding: 4px;")
-        self.log.append(f"✅ Done.\n{'─' * 40}\n")
+        self.status.setStyleSheet(PETITION_STATUS_DONE_STYLE)
+        self.log.append(f"[{ts}] ✅ Done.\n{'─' * 40}\n")
 
     def edit_prompt(self):
         from PySide6.QtWidgets import QInputDialog
@@ -2178,6 +2625,416 @@ class PetitionWidget(QWidget):
             self.current_prompt = dlg.textValue()
 
 
+class ExpectedOutputThread(QThread):
+    success = Signal(str)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, file_path, headers, engine, model_name, gemini_key, host):
+        super().__init__()
+        self.file_path = file_path
+        self.headers = headers
+        self.engine = engine
+        self.model_name = model_name
+        self.gemini_key = gemini_key
+        self.host = host
+
+    def run(self):
+        try:
+            from PIL import Image as PILImage
+            import fitz
+            import json
+            from ai import GeminiClient, OllamaClient, parse_json_rows
+
+            self.progress.emit("Reading document pages...")
+            images = []
+            text = ""
+
+            # Check engine
+            if self.engine == "gemini":
+                client = GeminiClient(api_key=self.gemini_key, model=self.model_name or DEFAULT_GEMINI_MODEL)
+                is_vision = True
+            else:
+                client = OllamaClient(host=self.host, vision_model=self.model_name, chat_model=self.model_name)
+                is_vision = client.is_vision_model(self.model_name)
+
+            if self.file_path.lower().endswith(".pdf"):
+                doc = fitz.open(self.file_path)
+                try:
+                    for page in doc:
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        if is_vision:
+                            images.append(img)
+                        else:
+                            try:
+                                import pytesseract as tess
+                                text += tess.image_to_string(img, lang="tam+eng", config="--psm 3") + "\n\n"
+                            except Exception:
+                                text += tess.image_to_string(img, config="--psm 3") + "\n\n"
+                finally:
+                    doc.close()
+            else:
+                img = PILImage.open(self.file_path).convert("RGB")
+                if is_vision:
+                    images.append(img)
+                else:
+                    try:
+                        import pytesseract as tess
+                        text += tess.image_to_string(img, lang="tam+eng", config="--psm 3") + "\n\n"
+                    except Exception:
+                        text += tess.image_to_string(img, config="--psm 3") + "\n\n"
+
+            self.progress.emit("AI extracting structured expected values...")
+            
+            headers_json = json.dumps({h: "" for h in self.headers}, ensure_ascii=False)
+            prompt = (
+                "Extract structured values from this sample expected output document.\n"
+                "Understand the context and identify values for each of the requested keys/columns.\n"
+                f"Use exactly these JSON keys: {headers_json}\n"
+                "Preserve Tamil script exactly as Unicode Tamil.\n"
+                "Return a JSON array containing a single object with the extracted keys and values. "
+                "Return ONLY raw valid JSON array, with no markdown code blocks, explanation, or other text."
+            )
+
+            system = "You are a precise document extraction model. Output valid JSON array only."
+            
+            if self.engine == "gemini":
+                schema = {
+                    "type": "object",
+                    "properties": {
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {header: {"type": "string"} for header in self.headers},
+                                "required": self.headers,
+                            },
+                        }
+                    },
+                    "required": ["rows"],
+                }
+                res = client.generate(prompt, images=images if images else None, system=system, schema=schema)
+            else:
+                res = client.generate(prompt, model=self.model_name, images=images if images else None, json_mode=True, system=system)
+
+            rows = parse_json_rows(res, self.headers)
+            if rows:
+                self.success.emit(json.dumps(rows, indent=2, ensure_ascii=False))
+            else:
+                self.success.emit(json.dumps([{h: "Not Specified" for h in self.headers}], indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ── CHANGE 4: Training Widget ──
+
+class TrainingWidget(QWidget):
+    """AI Training Session — create few-shot examples for guided extraction."""
+    templates_changed = Signal()
+
+    def __init__(self, fewshot_store, spreadsheet, parent=None):
+        super().__init__(parent)
+        self.store = fewshot_store
+        self.spreadsheet = spreadsheet
+        self.current_template_id = uuid.uuid4().hex
+        self.current_examples: list = []
+
+        # Template management
+        self.template_combo = QComboBox()
+        self.template_combo.setMinimumWidth(160)
+        self.template_combo.currentIndexChanged.connect(self._load_selected)
+        self.template_name = QLineEdit()
+        self.template_name.setPlaceholderText("Training template name...")
+
+        # Example input
+        self.example_image_path = QLabel("No image selected")
+        self.example_image_path.setStyleSheet("color: #64748b; font-size: 12px; padding: 4px;")
+        self.example_output = QTextEdit()
+        self.example_output.setPlaceholderText('Expected JSON output for the sample...\ne.g. [{"Sender Name": "ராஜா", "Amount": "50000"}]')
+        self.example_output.setMaximumHeight(200)
+
+        # Example list
+        self.example_list = QListWidget()
+        self.example_list.currentRowChanged.connect(self._example_selected)
+
+        self._current_image_path = ""
+
+        # Layout
+        header = QLabel("🧠 AI Training Session")
+        header.setStyleSheet("font-size: 16px; font-weight: 800; color: #d97706; padding: 4px 0;")
+
+        desc = QLabel("Train the AI by providing sample documents and their expected outputs.\nSave as a template and select it in the Petition Extractor.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #64748b; font-size: 12px; padding: 4px 0 8px 0;")
+
+        # Template section
+        tmpl_row = QHBoxLayout()
+        tmpl_row.addWidget(QLabel("Template:"))
+        tmpl_row.addWidget(self.template_combo, 1)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        name_row.addWidget(self.template_name, 1)
+
+        # Template buttons
+        btn_new = QPushButton("✨ New")
+        btn_new.clicked.connect(self.new_template)
+        style_sidebar_button(btn_new, "neutral")
+        btn_save = QPushButton("💾 Save")
+        btn_save.clicked.connect(self.save_template)
+        style_sidebar_button(btn_save, "success")
+        btn_delete = QPushButton("🗑 Delete")
+        btn_delete.clicked.connect(self.delete_template)
+        style_sidebar_button(btn_delete, "danger")
+
+        tmpl_btns = QHBoxLayout()
+        tmpl_btns.setSpacing(6)
+        tmpl_btns.addWidget(btn_new)
+        tmpl_btns.addWidget(btn_save)
+        tmpl_btns.addWidget(btn_delete)
+
+        # Example section
+        example_header = QLabel("TRAINING EXAMPLES")
+        example_header.setStyleSheet(SECTION_LABEL_STYLE)
+
+        btn_load_img = QPushButton("📄 Load Sample Document")
+        btn_load_img.clicked.connect(self._load_sample_image)
+        style_sidebar_button(btn_load_img, "primary")
+
+        btn_add_example = QPushButton("➕ Add Example")
+        btn_add_example.clicked.connect(self._add_example)
+        style_sidebar_button(btn_add_example, "structure")
+
+        btn_remove_example = QPushButton("❌ Remove Selected")
+        btn_remove_example.clicked.connect(self._remove_example)
+        style_sidebar_button(btn_remove_example, "danger")
+
+        example_btns = QHBoxLayout()
+        example_btns.addWidget(btn_add_example)
+        example_btns.addWidget(btn_remove_example)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.addWidget(header)
+        layout.addWidget(desc)
+        layout.addLayout(tmpl_row)
+        layout.addLayout(name_row)
+        layout.addLayout(tmpl_btns)
+
+        # Separator
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: #e2e8f0;")
+        layout.addWidget(sep)
+
+        layout.addWidget(example_header)
+        layout.addWidget(btn_load_img)
+        layout.addWidget(self.example_image_path)
+
+        output_label_row = QHBoxLayout()
+        output_label_row.addWidget(QLabel("Expected Output (JSON):"))
+        btn_load_output_pdf = QPushButton("📄 Load Expected Output PDF/Image")
+        btn_load_output_pdf.clicked.connect(self._load_expected_output_pdf)
+        style_sidebar_button(btn_load_output_pdf, "primary")
+        output_label_row.addWidget(btn_load_output_pdf)
+
+        layout.addLayout(output_label_row)
+        layout.addWidget(self.example_output)
+        layout.addLayout(example_btns)
+        layout.addWidget(QLabel("Saved Examples:"))
+        layout.addWidget(self.example_list, 1)
+
+        self.refresh_templates()
+        self.new_template()
+
+    def refresh_templates(self):
+        selected = self.current_template_id
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        self.template_combo.addItem("Select training template...", "")
+        for t in self.store.all():
+            self.template_combo.addItem(t.name, t.template_id)
+        idx = self.template_combo.findData(selected)
+        self.template_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.template_combo.blockSignals(False)
+
+    def new_template(self):
+        self.current_template_id = uuid.uuid4().hex
+        self.template_combo.setCurrentIndex(0)
+        self.template_name.clear()
+        self.current_examples = []
+        self.example_list.clear()
+        self._current_image_path = ""
+        self.example_image_path.setText("No image selected")
+        self.example_output.clear()
+
+    def _load_selected(self):
+        tid = self.template_combo.currentData()
+        if not tid:
+            return
+        t = self.store.get(tid)
+        if not t:
+            return
+        self.current_template_id = t.template_id
+        self.template_name.setText(t.name)
+        self.current_examples = [FewShotExample(image_path=e.image_path, output_json=e.output_json) for e in t.examples]
+        self._render_examples()
+
+    def _load_sample_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Sample Document", "", supported_file_filter())
+        if path:
+            self._current_image_path = path
+            self.example_image_path.setText(f"📎 {Path(path).name}")
+            self.example_image_path.setToolTip(path)
+
+    def _add_example(self):
+        output = self.example_output.toPlainText().strip()
+        if not output:
+            QMessageBox.warning(self, "Missing Output", "Enter the expected JSON output for this example.")
+            return
+        if not self._current_image_path:
+            QMessageBox.warning(self, "Missing Input", "Load a sample document image first.")
+            return
+        self.current_examples.append(FewShotExample(
+            image_path=self._current_image_path,
+            output_json=output
+        ))
+        self._current_image_path = ""
+        self.example_image_path.setText("No image selected")
+        self.example_output.clear()
+        self._render_examples()
+
+    def _remove_example(self):
+        row = self.example_list.currentRow()
+        if 0 <= row < len(self.current_examples):
+            self.current_examples.pop(row)
+            self._render_examples()
+
+    def _example_selected(self, row):
+        if 0 <= row < len(self.current_examples):
+            ex = self.current_examples[row]
+            self.example_output.setPlainText(ex.output_json)
+            self.example_image_path.setText(f"📎 {Path(ex.image_path).name}" if ex.image_path else "No image")
+
+    def _render_examples(self):
+        self.example_list.clear()
+        for i, ex in enumerate(self.current_examples, 1):
+            name = Path(ex.image_path).name if ex.image_path else "No image"
+            preview = ex.output_json[:60].replace('\n', ' ') + ('...' if len(ex.output_json) > 60 else '')
+            self.example_list.addItem(f"Example {i}: {name} → {preview}")
+
+    def save_template(self):
+        name = self.template_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Enter a template name.")
+            return
+        if not self.current_examples:
+            QMessageBox.warning(self, "No Examples", "Add at least one training example.")
+            return
+        t = FewShotTemplate(name=name, examples=list(self.current_examples), template_id=self.current_template_id)
+        self.store.upsert(t)
+        self.refresh_templates()
+        self.templates_changed.emit()
+        QMessageBox.information(self, "Saved", f"Training template '{name}' saved with {len(self.current_examples)} example(s).")
+
+    def delete_template(self):
+        if not self.current_template_id:
+            return
+        self.store.delete(self.current_template_id)
+        self.new_template()
+        self.refresh_templates()
+        self.templates_changed.emit()
+
+    def _get_headers(self) -> list[str]:
+        headers = []
+        for col in range(200):
+            val = self.spreadsheet.raw_values.get((0, col), "").strip()
+            if val and val != CLOUD_VERSION_COLUMN:
+                headers.append(val)
+        return headers
+
+    def _load_expected_output_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Expected Output PDF/Image", "", supported_file_filter())
+        if not path:
+            return
+
+        headers = self._get_headers()
+        if not headers:
+            headers = DEFAULT_PETITION_HEADERS
+
+        # Safely extract LLM settings from the active petition widget if available
+        engine = "local"
+        model_name = "minicpm-v"
+        gemini_key = ""
+        try:
+            petition = self.spreadsheet.window().petition
+            engine = str(petition.engine_combo.currentData() or "local")
+            model_name = petition.model_input.text().strip() or (DEFAULT_GEMINI_MODEL if engine == "gemini" else petition.model_name)
+            gemini_key = petition.gemini_key.text().strip()
+        except Exception:
+            pass
+
+        if engine == "gemini":
+            if not gemini_key and not os.environ.get("GEMINI_API_KEY"):
+                QMessageBox.warning(self, "Gemini API key needed", "Please configure the Gemini API key in the Petition Extractor tab first.")
+                return
+
+        try:
+            host = self.spreadsheet.window().chat.host.text()
+        except Exception:
+            host = "http://localhost:11434"
+
+        # Show a progress dialog
+        self.progress_dialog = QProgressDialog("Initializing expected output loader...", "Cancel", 0, 0, self)
+        self.progress_dialog.setWindowTitle("Extracting Expected Output")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        
+        # Style progress dialog to match premium look
+        self.progress_dialog.setStyleSheet(
+            "QProgressDialog { background-color: #ffffff; color: #1e293b; font-family: 'Segoe UI'; font-size: 13px; }"
+            "QLabel { color: #1e293b; font-weight: 500; }"
+            "QPushButton { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; }"
+            "QPushButton:hover { background: #e2e8f0; }"
+        )
+        self.progress_dialog.show()
+
+        # Launch the extraction thread
+        self._output_thread = ExpectedOutputThread(
+            path,
+            headers,
+            engine,
+            model_name,
+            gemini_key,
+            host
+        )
+        self._output_thread.progress.connect(self._on_output_progress)
+        self._output_thread.success.connect(self._on_output_success)
+        self._output_thread.error.connect(self._on_output_error)
+        
+        self.progress_dialog.canceled.connect(self._output_thread.terminate)
+        self._output_thread.start()
+
+    def _on_output_progress(self, msg: str):
+        if hasattr(self, 'progress_dialog') and self.progress_dialog.isVisible():
+            self.progress_dialog.setLabelText(msg)
+
+    def _on_output_success(self, json_data: str):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.close()
+        self.example_output.setPlainText(json_data)
+        try:
+            self.spreadsheet.window().statusBar().showMessage("✅ Expected output loaded successfully from document!", 5000)
+        except Exception:
+            pass
+
+    def _on_output_error(self, err_msg: str):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.close()
+        QMessageBox.critical(self, "Extraction Error", f"Failed to extract expected output:\n{err_msg}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2185,6 +3042,7 @@ class MainWindow(QMainWindow):
         self.resize(1500, 920)
 
         self.store = TemplateStore()
+        self.fewshot_store = FewShotStore()
 
         from rag import RAGDatabase
         ollama_client = OllamaClient()
@@ -2194,18 +3052,22 @@ class MainWindow(QMainWindow):
         self.spreadsheet = SpreadsheetWidget()
         self.templates = TemplateManagerWidget(self.store)
         self.extraction = ExtractionWidget(self.store, self.spreadsheet)
-        self.petition = PetitionWidget(self.spreadsheet)
+        self.petition = PetitionWidget(self.spreadsheet, self.fewshot_store)
         self.sources = SourcesWidget(self.rag)
         self.chat = ChatPanel(self.spreadsheet, self.rag)
+        self.training = TrainingWidget(self.fewshot_store, self.spreadsheet)
 
         self.templates.templates_changed.connect(self.extraction.refresh_templates)
+        # When training templates change, refresh petition's fewshot dropdown
+        self.training.templates_changed.connect(self.petition.refresh_fewshot_templates)
 
-        # Right side: tool panels in a stacked widget
+        # CHANGE 2: Right side — tool panels in a stacked widget, petition first
         self.tool_stack = QStackedWidget()
         self.tool_panels = {}
         for name, widget, label in [
+            ("petition", self.petition, "🛡 Petition Extractor"),
             ("chat", self.chat, "🤖 AI Chat"),
-            ("petition", self.petition, "🛡 Petitions"),
+            ("training", self.training, "🧠 AI Training"),
             ("vision", self.extraction, "📥 Vision Import"),
             ("template", self.templates, "📋 Templates"),
             ("notebook", self.sources, "📚 Notebook"),
@@ -2213,16 +3075,12 @@ class MainWindow(QMainWindow):
             self.tool_stack.addWidget(widget)
             self.tool_panels[name] = (widget, label)
 
-        # Side panel header with back button and title
-        self.panel_title = QLabel("🤖 AI Chat")
-        self.panel_title.setStyleSheet(
-            "font-size: 15px; font-weight: 700; color: #1e40af; padding: 6px 10px;"
-            "background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #f8fafc);"
-            "border: 1px solid #e2e8f0; border-radius: 8px;"
-        )
-        self.panel_back_btn = QPushButton("← Chat")
-        self.panel_back_btn.setFixedWidth(80)
-        self.panel_back_btn.clicked.connect(lambda: self.show_tool_panel("chat"))
+        # Side panel header with back button and title — default to Petition
+        self.panel_title = QLabel("🛡 Petition Extractor")
+        self.panel_title.setStyleSheet(SIDEBAR_HEADER_STYLE)
+        self.panel_back_btn = QPushButton("← Petition")
+        self.panel_back_btn.setFixedWidth(90)
+        self.panel_back_btn.clicked.connect(lambda: self.show_tool_panel("petition"))
         self.panel_back_btn.setStyleSheet(
             "QPushButton { background: #f1f5f9; color: #1e40af; border: 1px solid #e2e8f0;"
             "border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 600; }"
@@ -2235,8 +3093,9 @@ class MainWindow(QMainWindow):
         panel_header.addWidget(self.panel_back_btn)
         panel_header.addWidget(self.panel_title, 1)
 
+        # CHANGE 7: wider right panel
         right_panel = QWidget()
-        right_panel.setMinimumWidth(150)
+        right_panel.setMinimumWidth(360)
         self.spreadsheet.setMinimumWidth(200)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -2254,6 +3113,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self.spreadsheet.load_autosave_if_exists()
 
+        # CHANGE 2: Set petition as default panel
+        self.show_tool_panel("petition")
+
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -2264,6 +3126,7 @@ class MainWindow(QMainWindow):
         self.row_count_label.setStyleSheet("color: #475569; font-size: 12px;")
         self.status_bar.addPermanentWidget(self.row_count_label)
         self.status_bar.addPermanentWidget(self.ollama_status)
+        self._ollama_connected = False
         self._check_ollama_connection()
 
         self.autosave_timer = QTimer(self)
@@ -2284,14 +3147,19 @@ class MainWindow(QMainWindow):
             widget, label = self.tool_panels[name]
             self.tool_stack.setCurrentWidget(widget)
             self.panel_title.setText(label)
-            self.panel_back_btn.setVisible(name != "chat")
+            # CHANGE 7: back button visibility — hide when on petition (default)
+            self.panel_back_btn.setVisible(name != "petition")
 
     def _check_ollama_connection(self) -> None:
         client = OllamaClient()
         ok, _ = client.check_connection()
+        was_connected = getattr(self, "_ollama_connected", False)
+        self._ollama_connected = ok
         if ok:
             self.ollama_status.setText("● Ollama Connected")
             self.ollama_status.setStyleSheet("color: #059669; font-size: 12px; font-weight: 600; padding: 0 8px;")
+            if not was_connected:
+                self.petition.refresh_ollama_models()
         else:
             self.ollama_status.setText("○ Ollama Offline")
             self.ollama_status.setStyleSheet("color: #dc2626; font-size: 12px; font-weight: 600; padding: 0 8px;")
@@ -2302,6 +3170,10 @@ class MainWindow(QMainWindow):
         self.row_count_label.setText(f"{count} rows")
 
     def closeEvent(self, event) -> None:
+        # CHANGE 8: Stop any running PetitionThread
+        if self.petition._thread is not None and self.petition._thread.isRunning():
+            self.petition._thread.quit()
+            self.petition._thread.wait(3000)
         self.spreadsheet.autosave()
         super().closeEvent(event)
 

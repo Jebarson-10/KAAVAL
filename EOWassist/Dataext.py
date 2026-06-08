@@ -84,10 +84,10 @@ QToolTip { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; borde
 """
 
 MODEL_PRESETS = [
+    ("Qwen 2.5 VL 7B", "qwen2.5vl:7b"),
     ("Gemma 3 12B", "gemma3:12b"),
     ("Gemma 4 E2B", "gemma4:e2b"),
     ("Gemma 4 26B", "gemma4:26b"),
-    ("Qwen 2.5 VL 7B", "qwen2.5vl:7b"),
 ]
 
 DEFAULT_INSTRUCTION = """You are an expert data extractor. I will provide you with a transcription of Tamil legal/financial petitions. This text may represent one single petition spanning multiple pages, or multiple different petitions.
@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("✦ Tamil Petition Data Extractor")
         self.setGeometry(100, 100, 1400, 900)
 
-        self.model_name = "gemma3:12b"
+        self.model_name = "qwen2.5vl:7b"
         self.current_prompt = DEFAULT_INSTRUCTION
         self.init_ui()
         self.populate_default_headers()

@@ -9,6 +9,7 @@ from typing import Any
 
 from PIL import Image
 
+from bamini import convert_rows_to_bamini, unicode_to_bamini
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
 
@@ -16,7 +17,7 @@ from templates import ExtractionTemplate
 @dataclass
 class OllamaClient:
     host: str = "http://localhost:11434"
-    vision_model: str = "gemma3:12b"
+    vision_model: str = "qwen2.5vl:7b"
     chat_model: str = "gemma3:12b"
     embed_model: str = "nomic-embed-text"
     language_hint: str = "Tamil and English"
@@ -136,7 +137,8 @@ class OllamaClient:
             "If the crop is blank or unreadable, return an empty response."
         )
         system = "You are a careful OCR and document-table extraction model for Tamil and English legal/finance documents."
-        return self.generate(prompt, model=self.vision_model, images=[crop], system=system)
+        result = self.generate(prompt, model=self.vision_model, images=[crop], system=system)
+        return unicode_to_bamini(result)
 
     def extract_table_rows(self, template: ExtractionTemplate, image: Image.Image) -> list[dict[str, str]]:
         fields_json = json.dumps(template.field_names(), ensure_ascii=False)
@@ -154,7 +156,8 @@ class OllamaClient:
         )
         system = "You are a precise Tamil-English OCR engine. Your output must be valid JSON only."
         response = self.generate(prompt, model=self.vision_model, images=[image], json_mode=True, system=system)
-        return parse_json_rows(response, template.field_names())
+        rows = parse_json_rows(response, template.field_names())
+        return convert_rows_to_bamini(rows)
 
     def chat(self, prompt: str) -> str:
         system = "You are a local AI assistant. Answer clearly in Tamil or English based on the user's language."
@@ -186,8 +189,10 @@ def _error_hint(detail: str, code: int) -> str:
         return "The model may not be downloaded yet. Run: `ollama pull <model-name>`"
     if "out of memory" in lower or "oom" in lower:
         return "The model is too large for your GPU. Try a smaller model or increase VRAM."
+    if "missing data required for image input" in lower or "does not support images" in lower:
+        return "The selected model does not support vision (images). Try switching to a vision model like `qwen2.5vl` or `llama3.2-vision`."
     if code == 500:
-        return "Internal Ollama error. Try restarting Ollama: `ollama serve`"
+        return "Internal Ollama error. Try restarting Ollama: `ollama serve` or check if the model supports vision inputs."
     return "Check Ollama logs for more details."
 
 
@@ -204,7 +209,7 @@ def ocr_crop(crop: Image.Image) -> str:
         except Exception:
             return ""
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    return unicode_to_bamini("\n".join(lines))
 
 
 def parse_json_rows(text: str, fields: list[str]) -> list[dict[str, str]]:

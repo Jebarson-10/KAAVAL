@@ -11,10 +11,11 @@ from typing import Any
 
 from PIL import Image
 
+from bamini import convert_rows_to_bamini, unicode_to_bamini
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
 
-DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 try:
     import pytesseract  # type: ignore
@@ -155,7 +156,8 @@ class OllamaClient:
             "If the crop is blank or unreadable, return an empty response."
         )
         system = "You are a careful OCR and document-table extraction model for Tamil and English legal/finance documents."
-        return self.generate(prompt, model=self.vision_model, images=[crop], system=system)
+        result = self.generate(prompt, model=self.vision_model, images=[crop], system=system)
+        return unicode_to_bamini(result)
 
     def extract_table_rows(self, template: ExtractionTemplate, image: Image.Image) -> list[dict[str, str]]:
         fields_json = json.dumps(template.field_names(), ensure_ascii=False)
@@ -173,13 +175,14 @@ class OllamaClient:
         )
         system = "You are a precise Tamil-English OCR engine. Your output must be valid JSON only."
         response = self.generate(prompt, model=self.vision_model, images=[image], json_mode=True, system=system)
-        return parse_json_rows(response, template.field_names())
+        rows = parse_json_rows(response, template.field_names())
+        return convert_rows_to_bamini(rows)
 
     def chat(self, prompt: str) -> str:
         system = "You are a local AI assistant. Answer clearly in Tamil or English based on the user's language."
         return self.generate(prompt, model=self.chat_model, system=system)
 
-    def extract_flexible(self, headers: list[str], *, images: list[Image.Image] | None = None, text: str | None = None, instruction: str | None = None) -> list[dict[str, str]]:
+    def extract_flexible(self, headers: list[str], *, images: list[Image.Image] | None = None, text: str | None = None, instruction: str | None = None, fewshot_template=None) -> list[dict[str, str]]:
         """Extract data into a JSON list based on headers, using either vision (images) or OCR text."""
         headers_json = json.dumps({h: "" for h in headers}, ensure_ascii=False)
         default_inst = (
@@ -193,13 +196,34 @@ class OllamaClient:
             "If a value is not found, use \"Not Specified\".\n"
             "Return ONLY a raw JSON array, with no markdown formatting if possible."
         )
+        
+        all_images = []
+        if fewshot_template and hasattr(fewshot_template, 'examples') and fewshot_template.examples:
+            prompt += "\n\n=== TRAINING EXAMPLES ==="
+            for i, ex in enumerate(fewshot_template.examples, 1):
+                if getattr(ex, 'image_path', ''):
+                    try:
+                        img = Image.open(ex.image_path).convert("RGB")
+                        all_images.append(img)
+                        prompt += f"\nExample {i} Input Document: [See attached Image {len(all_images)}]\n"
+                    except Exception:
+                        pass
+                prompt += f"Example {i} Expected Output:\n{ex.output_json}\n"
+            prompt += "\n=== END OF TRAINING EXAMPLES ===\nNow process the new input document:"
+
+        if images:
+            for img in images:
+                all_images.append(img)
+                prompt += f"\n[See attached Image {len(all_images)} for New Input Document]\n"
+        
         if text:
             prompt += f"\n\nDocument Text:\n{text}"
 
         system = "You are a precise data extraction engine. Output must be valid JSON array only."
         model = self.vision_model if images else self.chat_model
-        response = self.generate(prompt, model=model, images=images, json_mode=True, system=system)
-        return parse_json_rows(response, headers)
+        response = self.generate(prompt, model=model, images=all_images if all_images else None, json_mode=True, system=system)
+        rows = parse_json_rows(response, headers)
+        return convert_rows_to_bamini(rows)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         payload: dict[str, Any] = {
@@ -307,6 +331,7 @@ class GeminiClient:
         images: list[Image.Image] | None = None,
         text: str | None = None,
         instruction: str | None = None,
+        fewshot_template=None
     ) -> list[dict[str, str]]:
         headers_json = json.dumps(headers, ensure_ascii=False)
         prompt = (
@@ -315,6 +340,26 @@ class GeminiClient:
             "Extract one row per distinct petitioner/entity. Preserve Tamil script exactly as Unicode Tamil. "
             "For missing values, return an empty string. Do not invent values."
         )
+        
+        all_images = []
+        if fewshot_template and hasattr(fewshot_template, 'examples') and fewshot_template.examples:
+            prompt += "\n\n=== TRAINING EXAMPLES ==="
+            for i, ex in enumerate(fewshot_template.examples, 1):
+                if getattr(ex, 'image_path', ''):
+                    try:
+                        img = Image.open(ex.image_path).convert("RGB")
+                        all_images.append(img)
+                        prompt += f"\nExample {i} Input Document: [See attached Image {len(all_images)}]\n"
+                    except Exception:
+                        pass
+                prompt += f"Example {i} Expected Output:\n{ex.output_json}\n"
+            prompt += "\n=== END OF TRAINING EXAMPLES ===\nNow process the new input document:"
+
+        if images:
+            for img in images:
+                all_images.append(img)
+                prompt += f"\n[See attached Image {len(all_images)} for New Input Document]\n"
+                
         if text:
             prompt += f"\n\nDocument Text:\n{text}"
         schema = {
@@ -332,8 +377,9 @@ class GeminiClient:
             "required": ["rows"],
         }
         system = "You are a precise Tamil-English legal and financial document extraction engine. Output valid JSON only."
-        response = self.generate(prompt, images=images, system=system, schema=schema)
-        return parse_json_rows(response, headers)
+        response = self.generate(prompt, images=all_images if all_images else None, system=system, schema=schema)
+        rows = parse_json_rows(response, headers)
+        return convert_rows_to_bamini(rows)
 
 
 def _error_hint(detail: str, code: int) -> str:
@@ -385,7 +431,7 @@ def ocr_crop(crop: Image.Image) -> str:
         except Exception:
             return ""
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    return unicode_to_bamini("\n".join(lines))
 
 
 def parse_json_rows(text: str, fields: list[str]) -> list[dict[str, str]]:
