@@ -107,7 +107,7 @@ class RAGDatabase:
             try:
                 # Try to extract text natively from PDF using fitz
                 if suffix == ".pdf":
-                    import fitz  # type: ignore
+                    import pymupdf as fitz  # type: ignore
                     doc = fitz.open(file_path)
                     page_text = doc[i].get_text()
                     doc.close()

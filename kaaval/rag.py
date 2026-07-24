@@ -117,7 +117,7 @@ def _extract_text_by_page(file_path: Path) -> list[str]:
     for i in range(pages):
         try:
             if suffix == ".pdf":
-                import fitz
+                import pymupdf as fitz
                 doc = fitz.open(file_path)
                 page_text = doc[i].get_text()
                 doc.close()

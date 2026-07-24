@@ -26,7 +26,7 @@ def render_page(path: str | Path, page_number: int = 0, zoom: float = 2.0) -> Im
         return Image.open(path).convert("RGB")
     if suffix in PDF_EXTENSIONS:
         try:
-            import fitz  # type: ignore
+            import pymupdf as fitz  # type: ignore
         except ImportError as exc:
             raise RuntimeError("PyMuPDF is required to read PDF files.") from exc
         doc = fitz.open(path)
@@ -48,7 +48,7 @@ def page_count(path: str | Path) -> int:
         return 1
     if suffix in PDF_EXTENSIONS:
         try:
-            import fitz  # type: ignore
+            import pymupdf as fitz  # type: ignore
         except ImportError as exc:
             raise RuntimeError("PyMuPDF is required to read PDF files.") from exc
         doc = fitz.open(path)

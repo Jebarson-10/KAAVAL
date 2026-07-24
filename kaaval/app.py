@@ -1889,7 +1889,7 @@ class PetitionThread(QThread):
 
     def run(self):
         from PIL import Image as PILImage
-        import fitz
+        import pymupdf as fitz
 
         if self.engine == "gemini":
             client = GeminiClient(api_key=self.gemini_api_key, model=self.model_name or DEFAULT_GEMINI_MODEL)
@@ -2700,7 +2700,7 @@ class ExpectedOutputThread(QThread):
     def run(self):
         try:
             from PIL import Image as PILImage
-            import fitz
+            import pymupdf as fitz
             import json
             from ai import GeminiClient, OllamaClient, parse_json_rows
 

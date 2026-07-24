@@ -119,7 +119,7 @@ class ExtractionThread(QThread):
                 self.progress.emit(f"[{i}/{total}] OCR processing {base_name}...", i, total)
 
                 if file_path.lower().endswith('.pdf'):
-                    import fitz
+                    import pymupdf as fitz
                     doc = fitz.open(file_path)
                     for page_num in range(len(doc)):
                         page = doc.load_page(page_num)
