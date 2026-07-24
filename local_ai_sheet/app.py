@@ -171,6 +171,7 @@ class SpreadsheetWidget(QWidget):
         item = self.table.item(row, col)
         if item is None:
             item = QTableWidgetItem("")
+            item.setFont(QFont("Bamini TAMIL", 10))
             self.table.setItem(row, col, item)
         return item
 
@@ -231,6 +232,10 @@ class SpreadsheetWidget(QWidget):
             for (row, col), raw in list(self.raw_values.items()):
                 item = self._ensure_item(row, col)
                 item.setText(self.engine.evaluate(raw) if raw.startswith("=") else raw)
+                f = item.font()
+                if f.family() not in ("Bamini TAMIL", "Bamini"):
+                    f.setFamily("Bamini TAMIL")
+                    item.setFont(f)
         finally:
             self._updating = False
 
@@ -283,6 +288,28 @@ class SpreadsheetWidget(QWidget):
                 if old_text:
                     new_text = unicode_to_bamini(old_text)
                     item.setText(new_text)
+                    f = item.font()
+                    f.setFamily("Bamini TAMIL")
+                    item.setFont(f)
+                    self.raw_values[(row, col)] = new_text
+        finally:
+            self._updating = False
+        self.recalculate()
+        self._mark_changed()
+
+    def decode_selected_to_unicode(self) -> None:
+        from bamini import bamini_to_unicode
+        self._updating = True
+        try:
+            for item in self.selected_items_or_cells():
+                row, col = item.row(), item.column()
+                old_text = self.raw_values.get((row, col), "")
+                if old_text:
+                    new_text = bamini_to_unicode(old_text)
+                    item.setText(new_text)
+                    f = item.font()
+                    f.setFamily("Nirmala UI")
+                    item.setFont(f)
                     self.raw_values[(row, col)] = new_text
         finally:
             self._updating = False

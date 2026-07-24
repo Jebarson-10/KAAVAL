@@ -58,6 +58,7 @@ from templates import (
     FewShotStore, FewShotExample, FewShotTemplate,
     load_settings, save_settings,
 )
+from bamini import convert_rows_to_bamini, convert_values_to_bamini, unicode_to_bamini, bamini_to_unicode
 from widgets import ImageSelectionCanvas
 from theme import (
     LIGHT_STYLESHEET, style_tool_button, CHAT_CSS,
@@ -324,6 +325,7 @@ class SpreadsheetWidget(QWidget):
             ("❌ Col", self.delete_column, "danger", None),
             (None, None, None, None),
             ("🔤 To Bamini", self.encode_selected_to_bamini, "training", None),
+            ("🔤 To Unicode", self.decode_selected_to_unicode, "training", None),
         ]
 
         self.font_combo = QFontComboBox()
@@ -374,6 +376,7 @@ class SpreadsheetWidget(QWidget):
         item = self.table.item(row, col)
         if item is None:
             item = QTableWidgetItem("")
+            item.setFont(QFont("Bamini TAMIL", 10))
             self.table.setItem(row, col, item)
         return item
 
@@ -434,6 +437,11 @@ class SpreadsheetWidget(QWidget):
             for (row, col), raw in list(self.raw_values.items()):
                 item = self._ensure_item(row, col)
                 item.setText(self.engine.evaluate(raw) if raw.startswith("=") else raw)
+                # Ensure Bamini font is always applied so Tamil glyphs render correctly
+                f = item.font()
+                if f.family() not in ("Bamini TAMIL", "Bamini"):
+                    f.setFamily("Bamini TAMIL")
+                    item.setFont(f)
         finally:
             self._updating = False
 
@@ -486,6 +494,28 @@ class SpreadsheetWidget(QWidget):
                 if old_text:
                     new_text = unicode_to_bamini(old_text)
                     item.setText(new_text)
+                    f = item.font()
+                    f.setFamily("Bamini TAMIL")
+                    item.setFont(f)
+                    self.raw_values[(row, col)] = new_text
+        finally:
+            self._updating = False
+        self.recalculate()
+        self._mark_changed()
+
+    def decode_selected_to_unicode(self) -> None:
+        from bamini import bamini_to_unicode
+        self._updating = True
+        try:
+            for item in self.selected_items_or_cells():
+                row, col = item.row(), item.column()
+                old_text = self.raw_values.get((row, col), "")
+                if old_text:
+                    new_text = bamini_to_unicode(old_text)
+                    item.setText(new_text)
+                    f = item.font()
+                    f.setFamily("Nirmala UI")
+                    item.setFont(f)
                     self.raw_values[(row, col)] = new_text
         finally:
             self._updating = False
@@ -937,6 +967,7 @@ class SpreadsheetWidget(QWidget):
         ]
         if not rows:
             return self._next_empty_row(), 0
+        rows = convert_rows_to_bamini(rows)
         checks = [money_check(row) for row in rows]
         include_money_check = any(check for check in checks)
         self.set_template_columns(template, include_money_check)
@@ -956,6 +987,10 @@ class SpreadsheetWidget(QWidget):
                     value = check if field_name == MONEY_CHECK_COLUMN else values.get(field_name, "")
                     item.setText(value)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+                    # Force Bamini TAMIL font so ASCII Bamini sequences display as proper Tamil glyphs
+                    f = item.font()
+                    f.setFamily("Bamini TAMIL")
+                    item.setFont(f)
                     if value:
                         self.raw_values[(current_row, col)] = value
                     else:
@@ -1903,7 +1938,7 @@ class PetitionThread(QThread):
                     self.file_finished.emit(base_name, 0)
                     continue
 
-                results = _clean_extracted_rows(results, self.headers)
+                results = convert_rows_to_bamini(_clean_extracted_rows(results, self.headers))
                 for row in results:
                     row["_file_path"] = file_path
                     self.row_extracted.emit(row)
@@ -2420,6 +2455,7 @@ class PetitionWidget(QWidget):
         self.progress.setValue(cur)
 
     def _on_row(self, data):
+        data = convert_values_to_bamini(data)
         headers = self._active_headers or self._get_headers()
         if not any(_is_meaningful_extracted_value(data.get(header, "")) for header in headers):
             return

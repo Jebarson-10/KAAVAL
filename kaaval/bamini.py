@@ -380,36 +380,75 @@ def has_tamil_unicode(text: str) -> bool:
 def unicode_to_bamini(text: str) -> str:
     """Convert Unicode Tamil text to Bamini font encoding.
 
-    Non-Tamil characters (English, digits, punctuation) pass through unchanged.
-    The conversion replaces longest Unicode sequences first to correctly handle
-    compound characters (uyir-mei letters).
+    Non-Tamil characters (English, digits) pass through unchanged.
+    English commas in mixed text are sanitized so they do not render as 'இ' in Bamini font.
     """
-    if not text or not has_tamil_unicode(text):
+    if not text:
         return text
 
-    result = text
+    # Pre-clean English commas followed by spaces or digits in Tamil text so they don't render as 'இ'
+    # In Bamini font, ASCII ',' displays as 'இ'. So an English comma in Tamil text is replaced with space.
+    cleaned_text = text
+    if has_tamil_unicode(cleaned_text):
+        cleaned_text = re.sub(r",(?=\s|\d|$)", " ", cleaned_text)
+
+    result = cleaned_text
     for unicode_seq, bamini_seq in _UNICODE_TO_BAMINI:
         result = result.replace(unicode_seq, bamini_seq)
     return result
 
 
 # Reverse mapping for Bamini → Unicode.
-# Sort by length of the Bamini sequence in descending order to avoid partial matches first.
 _BAMINI_TO_UNICODE: list[tuple[str, str]] = sorted(
-    [(bamini_seq, unicode_seq) for unicode_seq, bamini_seq in _UNICODE_TO_BAMINI],
+    [(bamini_seq, unicode_seq) for unicode_seq, bamini_seq in _UNICODE_TO_BAMINI if bamini_seq not in (",", ";", "/", "=")],
     key=lambda x: len(x[0]),
     reverse=True
 )
 
 
 def bamini_to_unicode(text: str) -> str:
-    """Convert Bamini legacy font encoded text to Unicode Tamil."""
+    """Convert Bamini legacy font encoded text to Unicode Tamil safely preserving English punctuation."""
     if not text:
         return text
 
     result = text
+
+    # Preserve dates like 12/05/2024 or 1/2
+    date_placeholders = []
+    def _save_date(m):
+        date_placeholders.append(m.group(0))
+        return f"__DATE_{len(date_placeholders)-1}__"
+    result = re.sub(r"\b\d{1,4}/\d{1,2}/\d{1,4}\b", _save_date, result)
+
+    # Preserve numbers with commas like 12,000 or English commas followed by space
+    comma_placeholders = []
+    def _save_comma(m):
+        comma_placeholders.append(m.group(0))
+        return f"__COMMA_{len(comma_placeholders)-1}__"
+    result = re.sub(r"(?<=\d),(?=\d)|,(?=\s|$)", _save_comma, result)
+
+    # Apply multi-character and standard Bamini mappings first
     for bamini_seq, unicode_seq in _BAMINI_TO_UNICODE:
         result = result.replace(bamini_seq, unicode_seq)
+
+    # Smart convert ',' to 'இ' ONLY if followed by a Bamini Tamil letter glyph
+    result = re.sub(r",(?=[a-zA-Z;\[\]])", "இ", result)
+
+    # Smart convert ';' to '்' ONLY if preceded by a letter/consonant
+    result = re.sub(r"(?<=[a-zA-Zஅ-ஹ]);", "்", result)
+
+    # Smart convert '/' to 'ஃ'
+    result = re.sub(r"(?<=\s|^)/(?=\s|[a-zA-Zஅ-ஹ]|$)", "ஃ", result)
+
+    # Smart convert '=' to 'ஸ்ரீ'
+    result = re.sub(r"=(?=[a-zA-Zஅ-ஹ]|$)", "ஸ்ரீ", result)
+
+    # Restore preserved commas and dates
+    for idx, orig in enumerate(comma_placeholders):
+        result = result.replace(f"__COMMA_{idx}__", orig)
+    for idx, orig in enumerate(date_placeholders):
+        result = result.replace(f"__DATE_{idx}__", orig)
+
     return result
 
 
