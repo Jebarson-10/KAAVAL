@@ -13,13 +13,11 @@ from PIL import Image
 
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
-from bamini import convert_rows_to_bamini, unicode_to_bamini
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
 try:
     import pytesseract  # type: ignore
-    import os
     _tess_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
     if os.path.exists(_tess_path):
         pytesseract.pytesseract.tesseract_cmd = _tess_path

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import os
 import re
@@ -12,7 +11,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from PySide6.QtCore import QTimer, Qt, Signal, QThread, QMimeData
+from PySide6.QtCore import QTimer, Qt, Signal, QThread
 from PySide6.QtGui import QColor, QFont, QShortcut, QKeySequence, QDragEnterEvent, QDropEvent, QPen, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,16 +40,16 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ai import DEFAULT_GEMINI_MODEL, GeminiClient, OllamaClient, build_chat_prompt, extraction_summary, ocr_crop, tesseract_status
+from ai import DEFAULT_GEMINI_MODEL, GeminiClient, OllamaClient, extraction_summary, ocr_crop, tesseract_status
 from document import crop_normalized, existing_supported, page_count, render_page, supported_file_filter
 from formula import FormulaEngine, column_name
 from templates import (
@@ -58,7 +57,7 @@ from templates import (
     FewShotStore, FewShotExample, FewShotTemplate,
     load_settings, save_settings,
 )
-from bamini import convert_rows_to_bamini, convert_values_to_bamini, unicode_to_bamini, bamini_to_unicode
+from bamini import convert_rows_to_bamini, convert_values_to_bamini
 from widgets import ImageSelectionCanvas
 from theme import (
     LIGHT_STYLESHEET, style_tool_button, CHAT_CSS,
@@ -69,10 +68,9 @@ from theme import (
 
 try:
     import pytesseract  # type: ignore
-    import os
-    tess_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-    if os.path.exists(tess_path):
-        pytesseract.pytesseract.tesseract_cmd = tess_path
+    _tess_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    if os.path.exists(_tess_path):
+        pytesseract.pytesseract.tesseract_cmd = _tess_path
 except ImportError:
     pass
 
@@ -97,7 +95,6 @@ class SpreadsheetDelegate(QStyledItemDelegate):
         painter.save()
         
         # 1. Let Qt draw the standard background, fill color, and text
-        from PySide6.QtWidgets import QStyleOptionViewItem
         opt = QStyleOptionViewItem(option)
         is_selected = opt.state & QStyle.StateFlag.State_Selected
         
@@ -1016,7 +1013,6 @@ class SpreadsheetWidget(QWidget):
 
     def table_context_csv(self, max_rows: int = 60) -> str:
         from bamini import bamini_to_unicode
-        output = []
         headers = [self.table.horizontalHeaderItem(col).text() if self.table.horizontalHeaderItem(col) else column_name(col) for col in range(self.table.columnCount())]
         active_cols = self._active_columns()
         if not active_cols:

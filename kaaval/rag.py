@@ -1,4 +1,3 @@
-import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +7,6 @@ from document import page_count, render_page
 
 try:
     import chromadb
-    from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
     HAS_CHROMADB = True
 except ImportError:
     HAS_CHROMADB = False
