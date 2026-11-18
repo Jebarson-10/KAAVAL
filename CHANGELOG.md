@@ -16,6 +16,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [v1.0.3]
+
+### Fixed
+- Display original Unicode text in the spreadsheet by default.
+- Added an optional Bamini preview for Tamil text without changing cell values.
+
 ## [v1.0.2]
 
 ### Fixed

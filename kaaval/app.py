@@ -95,7 +95,7 @@ LEGACY_BAMINI_ROLE = Qt.ItemDataRole.UserRole + 1
 try:
     from _version import __version__
 except ImportError:
-    __version__ = "1.0.2+dev"
+    __version__ = "1.0.3+dev"
 
 VISION_MODEL_PRESETS = [
     ("Qwen 2.5 VL (Best for Tamil OCR)", "qwen2.5-vl"),
@@ -111,6 +111,7 @@ VISION_MODEL_PRESETS = [
 class SpreadsheetDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.preview_bamini = False
         families = {name.casefold(): name for name in QFontDatabase.families()}
         self.bamini_family = next(
             (families[name] for name in ("bamini", "bamini tamil", "bamini-tamil01") if name in families),
@@ -175,7 +176,7 @@ class SpreadsheetDelegate(QStyledItemDelegate):
         if is_selected:
             opt.state &= ~QStyle.StateFlag.State_Selected
 
-        if self.bamini_family and has_tamil_unicode(str(index.data() or "")):
+        if self.preview_bamini and self.bamini_family and has_tamil_unicode(str(index.data() or "")):
             self._paint_unicode_tamil(painter, opt, index)
         else:
             super().paint(painter, opt, index)
@@ -449,6 +450,9 @@ class SpreadsheetWidget(QWidget):
             ("Convert to Bamini", self.encode_selected_to_bamini),
             ("Convert to Unicode", self.decode_selected_to_unicode),
         ])
+        preview = button(formatting, "Bamini", "Preview Unicode Tamil in Bamini", self._toggle_bamini_preview)
+        preview.setCheckable(True)
+        preview.setEnabled(bool(self.table.itemDelegate().bamini_family))
         button(formatting, "Cells", "Row, column, and merge commands", actions=[
             ("Merge Cells", self.merge_selection),
             ("Unmerge Cells", self.unmerge_selection),
@@ -461,6 +465,10 @@ class SpreadsheetWidget(QWidget):
         ])
         formatting.addStretch()
         return ribbon
+
+    def _toggle_bamini_preview(self, enabled: bool) -> None:
+        self.table.itemDelegate().preview_bamini = enabled
+        self.table.viewport().update()
 
     def _toggle_tool_panel(self) -> None:
         window = self.window()
