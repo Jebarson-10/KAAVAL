@@ -10,7 +10,8 @@ dist/
 *.log
 .vscode/
 .idea/
-*.spec
+# *.spec   ← kept: kaaval.spec must be tracked for CI/CD builds
 *.lnk
 vector_db/
 autosave.laisheet
+kaaval/_version.py
