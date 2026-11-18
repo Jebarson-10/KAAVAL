@@ -6,7 +6,7 @@ LIGHT_STYLESHEET = """
 QWidget {
     background-color: #f8fafc;
     color: #1e293b;
-    font-family: "Bamini TAMIL", "Bamini", "Segoe UI", "Inter", system-ui, sans-serif;
+    font-family: "Segoe UI", "Nirmala UI", sans-serif;
     font-size: 13px;
 }
 
@@ -396,7 +396,7 @@ def style_sidebar_button(button, tone: str) -> None:
     )
 CHAT_CSS = """
 <style>
-body { font-family: 'Bamini TAMIL', 'Bamini', 'Segoe UI', sans-serif; background: #ffffff; color: #1e293b; }
+body { font-family: 'Segoe UI', 'Nirmala UI', sans-serif; background: #ffffff; color: #1e293b; }
 .user-msg {
     background: linear-gradient(135deg, #2563eb, #3b82f6);
     color: white; border-radius: 18px 18px 4px 18px;

@@ -16,6 +16,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [v1.0.2]
+
+### Fixed
+- Kept ordinary English readable when opening sheets with an old Bamini cell font.
+- Widened the ribbon font-size field and added the build version to the window title.
+- Made Gemini 3.8 Flash the default and added Gemini 4 Hydrogen as a preset.
+
 ## [v1.0.1]
 
 ### Fixed

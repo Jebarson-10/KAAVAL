@@ -57,7 +57,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ai import DEFAULT_GEMINI_MODEL, GeminiClient, OllamaClient, extraction_summary, ocr_crop, tesseract_status
+from ai import (
+    DEFAULT_GEMINI_MODEL, GEMINI_FALLBACK_MODEL, GEMINI_MODEL_PRESETS,
+    GeminiClient, OllamaClient, extraction_summary, ocr_crop, tesseract_status,
+)
 from document import crop_normalized, existing_supported, page_count, render_page, supported_file_filter
 from formula import FormulaEngine, column_name
 from templates import (
@@ -87,6 +90,12 @@ AUTOSAVE_FILE = APP_DIR / "autosave.laisheet"
 MONEY_CHECK_COLUMN = "Money Check"
 CLOUD_VERSION_COLUMN = "Cloud Version"
 DEFAULT_CELL_FONT_SIZE = 10
+LEGACY_BAMINI_ROLE = Qt.ItemDataRole.UserRole + 1
+
+try:
+    from _version import __version__
+except ImportError:
+    __version__ = "1.0.2+dev"
 
 VISION_MODEL_PRESETS = [
     ("Qwen 2.5 VL (Best for Tamil OCR)", "qwen2.5-vl"),
@@ -110,8 +119,10 @@ class SpreadsheetDelegate(QStyledItemDelegate):
 
     def initStyleOption(self, option, index) -> None:
         super().initStyleOption(option, index)
-        if self.bamini_family and option.font.family().casefold().startswith("bamini"):
+        if index.data(LEGACY_BAMINI_ROLE) and self.bamini_family:
             option.font.setFamily(self.bamini_family)
+        elif option.font.family().casefold().startswith("bamini"):
+            option.font.setFamily("Segoe UI")
 
     def _paint_unicode_tamil(self, painter, option, index) -> None:
         self.initStyleOption(option, index)
@@ -341,13 +352,13 @@ class SpreadsheetWidget(QWidget):
         ribbon = QWidget()
         ribbon.setObjectName("sheetRibbon")
         ribbon.setStyleSheet("""
-            QWidget#sheetRibbon { background: #eef3f7; border: 1px solid #d5dfe8; border-radius: 6px; }
+            QWidget#sheetRibbon { background: #f3f7f4; border: 1px solid #cddbd2; border-radius: 6px; }
             QWidget#sheetRibbon QToolButton {
                 background: transparent; border: 1px solid transparent;
                 border-radius: 4px; padding: 3px 6px; min-height: 22px;
             }
-            QWidget#sheetRibbon QToolButton:hover { background: #dbeaf5; border-color: #bccfe0; }
-            QWidget#sheetRibbon QToolButton:pressed { background: #caddeb; }
+            QWidget#sheetRibbon QToolButton:hover { background: #e0eee5; border-color: #a9c7b4; }
+            QWidget#sheetRibbon QToolButton:pressed { background: #cde4d5; }
             QWidget#sheetRibbon QComboBox, QWidget#sheetRibbon QSpinBox {
                 background: white; border: 1px solid #bccbd8;
                 border-radius: 4px; padding: 2px 5px; min-height: 22px;
@@ -355,6 +366,7 @@ class SpreadsheetWidget(QWidget):
             QWidget#sheetRibbon QComboBox:focus, QWidget#sheetRibbon QSpinBox:focus {
                 border-color: #47719a;
             }
+            QWidget#sheetRibbon QSpinBox QLineEdit { padding: 0; border: 0; }
         """)
         layout = QVBoxLayout(ribbon)
         layout.setContentsMargins(6, 5, 6, 5)
@@ -386,7 +398,7 @@ class SpreadsheetWidget(QWidget):
 
         button(commands, "", "Open workbook", self.open_native, icon=QStyle.StandardPixmap.SP_DialogOpenButton)
         button(commands, "", "Save workbook", self.save_native, icon=QStyle.StandardPixmap.SP_DialogSaveButton)
-        button(commands, "", "Export to Excel (Ctrl+E)", self.export_xlsx, icon=QStyle.StandardPixmap.SP_DialogApplyButton)
+        button(commands, "Export", "Export to Excel (Ctrl+E)", self.export_xlsx)
         button(commands, "File", "File commands", actions=[
             ("Save As", self.save_native_as),
             ("Clear Sheet", self.clear_sheet),
@@ -414,16 +426,18 @@ class SpreadsheetWidget(QWidget):
         self.font_size = QSpinBox()
         self.font_size.setRange(6, 144)
         self.font_size.setValue(DEFAULT_CELL_FONT_SIZE)
-        self.font_size.setFixedWidth(56)
+        self.font_size.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.font_size.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.font_size.setFixedWidth(64)
         self.font_size.setKeyboardTracking(False)
         self.font_size.setToolTip("Font size in points")
         self.font_size.setAccessibleName("Font size")
         self.font_size.valueChanged.connect(self.apply_font_size)
         formatting.addWidget(self.font_size)
 
-        button(formatting, "B", "Bold (Ctrl+B)", self.apply_bold)
-        button(formatting, "I", "Italic (Ctrl+I)", self.apply_italic)
-        button(formatting, "U", "Underline (Ctrl+U)", self.apply_underline)
+        button(formatting, "B", "Bold (Ctrl+B)", self.apply_bold).setStyleSheet("font-weight: bold;")
+        button(formatting, "I", "Italic (Ctrl+I)", self.apply_italic).setStyleSheet("font-style: italic;")
+        button(formatting, "U", "Underline (Ctrl+U)", self.apply_underline).setStyleSheet("text-decoration: underline;")
         button(formatting, "Format", "Cell formatting", actions=[
             ("Text Color", self.apply_text_color),
             ("Fill Color", self.apply_fill_color),
@@ -476,6 +490,9 @@ class SpreadsheetWidget(QWidget):
         raw = self._raw_value(row, col)
         if text == (self.engine.evaluate(raw) if raw.startswith("=") else raw):
             return
+        if item and item.data(LEGACY_BAMINI_ROLE):
+            with QSignalBlocker(self.table):
+                item.setData(LEGACY_BAMINI_ROLE, None)
         if text:
             self.raw_values[(row, col)] = text
         else:
@@ -600,11 +617,14 @@ class SpreadsheetWidget(QWidget):
             for item in self.selected_items_or_cells():
                 row, col = item.row(), item.column()
                 old_text = self.raw_values.get((row, col), "")
-                if old_text:
+                if has_tamil_unicode(old_text) and all(
+                    tamil or not part.strip() for part, tamil in bamini_display_runs(old_text)
+                ):
                     new_text = unicode_to_bamini(old_text)
                     item.setText(new_text)
+                    item.setData(LEGACY_BAMINI_ROLE, True)
                     f = item.font()
-                    f.setFamily("Bamini TAMIL")
+                    f.setFamily(self.table.itemDelegate().bamini_family or "Bamini")
                     item.setFont(f)
                     self.raw_values[(row, col)] = new_text
         finally:
@@ -619,9 +639,12 @@ class SpreadsheetWidget(QWidget):
             for item in self.selected_items_or_cells():
                 row, col = item.row(), item.column()
                 old_text = self.raw_values.get((row, col), "")
-                if old_text:
+                if old_text and not has_tamil_unicode(old_text) and (
+                    item.data(LEGACY_BAMINI_ROLE) or item.font().family().casefold().startswith("bamini")
+                ):
                     new_text = bamini_to_unicode(old_text)
                     item.setText(new_text)
+                    item.setData(LEGACY_BAMINI_ROLE, None)
                     f = item.font()
                     f.setFamily("Nirmala UI")
                     item.setFont(f)
@@ -1132,7 +1155,7 @@ class SpreadsheetWidget(QWidget):
             for col in active_cols:
                 item = self.table.item(row, col)
                 value = item.text() if item else ""
-                if item and item.font().family().casefold().startswith("bamini") and not has_tamil_unicode(value):
+                if item and item.data(LEGACY_BAMINI_ROLE) and not has_tamil_unicode(value):
                     value = bamini_to_unicode(value)
                 values.append(value)
             if not any(values):
@@ -1340,7 +1363,11 @@ class SpreadsheetWidget(QWidget):
                     background = item.background()
                     font_color = qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None
                     cell.font = Font(
-                        name=font.family(),
+                        name=(
+                            "Segoe UI"
+                            if font.family().casefold().startswith("bamini") and not item.data(LEGACY_BAMINI_ROLE)
+                            else font.family()
+                        ),
                         size=font.pointSize() if font.pointSize() > 0 else DEFAULT_CELL_FONT_SIZE,
                         bold=font.bold(),
                         italic=font.italic(),
@@ -2306,22 +2333,8 @@ class PetitionWidget(QWidget):
         curr_text = self.model_input.text()
         self.model_input.clear()
         
-        gemini_presets = [
-            ("gemini-3.5-flash", "Gemini 3.5 Flash (Latest)"),
-            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash-Lite (Efficient)"),
-            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro (Advanced)"),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash"),
-            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite"),
-            ("gemini-1.5-flash", "Gemini 1.5 Flash (Cheaper)"),
-            ("gemini-1.5-flash-8b", "Gemini 1.5 Flash 8B (Budget)"),
-            ("gemini-1.5-pro", "Gemini 1.5 Pro (Standard)"),
-        ]
-        
-        for idx, (m, label) in enumerate(gemini_presets):
-            # All these models have native vision support
-            display_label = f"👁 {label} [{m}]"
-            self.model_input.addItem(display_label, m)
+        for label, model in GEMINI_MODEL_PRESETS:
+            self.model_input.addItem(label, model)
             
         # Restore selection
         if curr_text:
@@ -2334,7 +2347,7 @@ class PetitionWidget(QWidget):
             if not found:
                 self.model_input.setEditText(curr_text)
         else:
-            # Default to gemini-3.5-flash
+            # Default to the first preset.
             self.model_input.setCurrentIndex(0)
             
         self.model_input.blockSignals(False)
@@ -2369,18 +2382,8 @@ class PetitionWidget(QWidget):
             self._local_model_name = self.model_input.text().strip() or self._local_model_name
             self.model_combo.setEnabled(True)
             
-            gemini_combo_presets = [
-                ("Gemini 3.5 Flash (Latest)", "gemini-3.5-flash"),
-                ("Gemini 3.1 Flash-Lite", "gemini-3.1-flash-lite"),
-                ("Gemini 3.1 Pro", "gemini-3.1-pro-preview"),
-                ("Gemini 2.5 Flash", "gemini-2.5-flash"),
-                ("Gemini 2.5 Pro", "gemini-2.5-pro"),
-                ("Gemini 2.5 Flash-Lite", "gemini-2.5-flash-lite"),
-                ("Gemini 1.5 Flash (Cheaper)", "gemini-1.5-flash"),
-                ("Gemini 1.5 Pro (Standard)", "gemini-1.5-pro"),
-            ]
-            for label, val in gemini_combo_presets:
-                self.model_combo.addItem(label, val)
+            for label, model in GEMINI_MODEL_PRESETS:
+                self.model_combo.addItem(label, model)
                 
             self.model_input.setPlaceholderText("Gemini model")
             self.refresh_gemini_models()
@@ -2603,7 +2606,7 @@ class PetitionWidget(QWidget):
 
         if self.engine_name == "gemini" or getattr(self, "_in_fallback", False):
             cloud_col = self._cloud_version_col if self._cloud_version_col is not None else self._ensure_cloud_version_column()
-            model_used = "gemini-3.1-flash-lite" if getattr(self, "_in_fallback", False) else self._gemini_model_name
+            model_used = GEMINI_FALLBACK_MODEL if getattr(self, "_in_fallback", False) else self._gemini_model_name
             self.spreadsheet.raw_values[(row, cloud_col)] = model_used
 
         self.spreadsheet.recalculate()
@@ -2718,7 +2721,7 @@ class PetitionWidget(QWidget):
                 return
 
             self._in_fallback = True
-            fallback_model = "gemini-3.1-flash-lite"
+            fallback_model = GEMINI_FALLBACK_MODEL
 
             self.log.append(f"[{ts}] 🔄 [Fallback] Auto-switching to Cloud Gemini ({fallback_model}) to redo unfilled/failed files...")
             self.log.append(f"[{ts}] [Fallback] Files to redo: {', '.join(Path(p).name for p in self._fallback_paths)}")
@@ -3220,7 +3223,7 @@ class TrainingWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("KAAVAL — Knowledge & Advanced Analysis for Vigilance & Asset Loss")
+        self.setWindowTitle(f"KAAVAL {__version__} | Petition Spreadsheet")
         screen = self.screen().availableGeometry()
         self.resize(min(1500, screen.width() - 32), min(920, screen.height() - 64))
 
@@ -3308,7 +3311,7 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("KAAVAL v1.0 — Tamil Nadu Police EOW")
+        self.status_bar.showMessage(f"KAAVAL {__version__} | Tamil Nadu Police EOW")
         self.ollama_status = QLabel("● Checking...")
         self.ollama_status.setStyleSheet("color: #64748b; font-size: 12px; padding: 0 8px;")
         self.row_count_label = QLabel("")
@@ -3384,6 +3387,7 @@ def item_has_custom_style(item: QTableWidgetItem | None) -> bool:
         or font.underline()
         or (font.pointSize() > 0 and font.pointSize() != DEFAULT_CELL_FONT_SIZE)
         or font.family() != "Segoe UI"
+        or item.data(LEGACY_BAMINI_ROLE)
         or item.foreground().style() != Qt.BrushStyle.NoBrush
         or item.background().style() != Qt.BrushStyle.NoBrush
         or item.textAlignment() != 0
@@ -3402,6 +3406,7 @@ def item_to_style(item: QTableWidgetItem | None) -> dict[str, object]:
         "underline": font.underline(),
         "family": font.family(),
         "point_size": font.pointSize(),
+        "legacy_bamini": bool(item.data(LEGACY_BAMINI_ROLE)),
         "foreground": qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None,
         "background": qcolor_to_rgb(background.color()) if background.style() != Qt.BrushStyle.NoBrush else None,
         "alignment": int(item.textAlignment()),
@@ -3417,6 +3422,8 @@ def apply_item_style(item: QTableWidgetItem, style: object) -> None:
     size = style.get("point_size")
     if isinstance(size, int) and 6 <= size <= 144:
         font.setPointSize(size)
+    if style.get("legacy_bamini"):
+        item.setData(LEGACY_BAMINI_ROLE, True)
     font.setBold(bool(style.get("bold")))
     font.setItalic(bool(style.get("italic")))
     font.setUnderline(bool(style.get("underline")))

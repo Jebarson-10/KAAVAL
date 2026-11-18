@@ -14,13 +14,22 @@ from PIL import Image
 from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
 
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL_PRESETS = [
+    ("Gemini 3.8 Flash", DEFAULT_GEMINI_MODEL),
+    ("Gemini 4 Hydrogen", "gemini-4-hydrogen"),
+    ("Gemini 3.1 Pro (Preview)", "gemini-3.1-pro-preview"),
+    ("Gemini 3.5 Flash-Lite", GEMINI_FALLBACK_MODEL),
+]
 PETITION_LANGUAGE_RULES = (
     "Read the petition in context. Transcribe Tamil passages in proper Unicode Tamil, "
     "including when the document uses a legacy Tamil font. Use natural Tamil for any "
     "summary of Tamil passages. Copy English words, names, and phrases from the source "
     "in English with their original spelling; do not translate or transliterate them. "
-    "Keep mixed-language fields mixed. Preserve identifiers, dates, amounts, and numbers. "
+    "Write generated labels and status text in English. Use Tamil script only for content "
+    "that is Tamil in the source. Keep mixed-language fields mixed. Preserve identifiers, "
+    "dates, amounts, and numbers. Leave illegible values blank instead of guessing. "
     "Never output Bamini keystrokes. Training examples are for field structure and do "
     "not override these language rules."
 )
@@ -282,7 +291,7 @@ class GeminiClient:
             )
         payload: dict[str, Any] = {
             "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"temperature": 0},
+            "generationConfig": {},
         }
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
@@ -320,7 +329,7 @@ class GeminiClient:
         for candidate in data.get("candidates", []):
             content = candidate.get("content", {})
             for part in content.get("parts", []):
-                if isinstance(part, dict) and part.get("text"):
+                if isinstance(part, dict) and part.get("text") and not part.get("thought"):
                     texts.append(str(part.get("text")))
         if texts:
             return "\n".join(texts).strip()
