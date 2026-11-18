@@ -12,6 +12,7 @@ replacements.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # ---------------------------------------------------------------------------
 # Unicode → Bamini mapping
@@ -377,6 +378,21 @@ def has_tamil_unicode(text: str) -> bool:
     return bool(_TAMIL_UNICODE_RE.search(text))
 
 
+def bamini_display_runs(text: str) -> list[tuple[str, bool]]:
+    """Return display runs with an explicit font choice for each script."""
+    runs = []
+    for part in re.split(r"([\u0B80-\u0BFF]+)", text):
+        if not part:
+            continue
+        if has_tamil_unicode(part):
+            encoded = unicode_to_bamini(unicodedata.normalize("NFC", part))
+            if not has_tamil_unicode(encoded):
+                runs.append((encoded, True))
+                continue
+        runs.append((part, False))
+    return runs
+
+
 def unicode_to_bamini(text: str) -> str:
     """Convert Unicode Tamil text to Bamini font encoding.
 
@@ -438,7 +454,7 @@ def bamini_to_unicode(text: str) -> str:
     result = re.sub(r"(?<=[a-zA-Zஅ-ஹ]);", "்", result)
 
     # Smart convert '/' to 'ஃ'
-    result = re.sub(r"(?<=\s|^)/(?=\s|[a-zA-Zஅ-ஹ]|$)", "ஃ", result)
+    result = re.sub(r"(?<!\S)/(?=\s|[a-zA-Zஅ-ஹ]|$)", "ஃ", result)
 
     # Smart convert '=' to 'ஸ்ரீ'
     result = re.sub(r"=(?=[a-zA-Zஅ-ஹ]|$)", "ஸ்ரீ", result)

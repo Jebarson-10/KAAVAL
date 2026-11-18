@@ -5,14 +5,20 @@ import os
 import re
 import sys
 import uuid
+from copy import copy
 from datetime import datetime
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from PySide6.QtCore import QTimer, Qt, Signal, QThread
-from PySide6.QtGui import QColor, QFont, QShortcut, QKeySequence, QDragEnterEvent, QDropEvent, QPen, QPainter
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal, QThread
+from PySide6.QtGui import (
+    QColor, QFont, QFontDatabase, QShortcut, QKeySequence, QDragEnterEvent,
+    QDropEvent, QPen, QPainter, QTextCharFormat, QTextCursor, QTextDocument,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -34,6 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QProgressDialog,
+    QScrollArea,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -45,6 +52,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextBrowser,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -57,7 +65,7 @@ from templates import (
     FewShotStore, FewShotExample, FewShotTemplate,
     load_settings, save_settings,
 )
-from bamini import convert_rows_to_bamini, convert_values_to_bamini
+from bamini import bamini_display_runs, has_tamil_unicode
 from widgets import ImageSelectionCanvas
 from theme import (
     LIGHT_STYLESHEET, style_tool_button, CHAT_CSS,
@@ -78,6 +86,7 @@ NATIVE_FILE_FILTER = "Local AI Sheet (*.laisheet)"
 AUTOSAVE_FILE = APP_DIR / "autosave.laisheet"
 MONEY_CHECK_COLUMN = "Money Check"
 CLOUD_VERSION_COLUMN = "Cloud Version"
+DEFAULT_CELL_FONT_SIZE = 10
 
 VISION_MODEL_PRESETS = [
     ("Qwen 2.5 VL (Best for Tamil OCR)", "qwen2.5-vl"),
@@ -91,6 +100,59 @@ VISION_MODEL_PRESETS = [
 
 
 class SpreadsheetDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        families = {name.casefold(): name for name in QFontDatabase.families()}
+        self.bamini_family = next(
+            (families[name] for name in ("bamini", "bamini tamil", "bamini-tamil01") if name in families),
+            next((name for key, name in sorted(families.items()) if key.startswith("bamini")), ""),
+        )
+
+    def initStyleOption(self, option, index) -> None:
+        super().initStyleOption(option, index)
+        if self.bamini_family and option.font.family().casefold().startswith("bamini"):
+            option.font.setFamily(self.bamini_family)
+
+    def _paint_unicode_tamil(self, painter, option, index) -> None:
+        self.initStyleOption(option, index)
+        widget = option.widget
+        style = widget.style() if widget else QApplication.style()
+        rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, option, widget)
+        text = option.text
+        option.text = ""
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, widget)
+
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        text_option = document.defaultTextOption()
+        text_option.setAlignment(option.displayAlignment & Qt.AlignmentFlag.AlignHorizontal_Mask)
+        if not option.features & QStyleOptionViewItem.ViewItemFeature.WrapText:
+            text_option.setWrapMode(text_option.WrapMode.NoWrap)
+        document.setDefaultTextOption(text_option)
+        document.setTextWidth(max(0, rect.width() - 6))
+        cursor = QTextCursor(document)
+        for part, tamil in bamini_display_runs(text):
+            font = QFont(option.font)
+            if tamil:
+                font.setFamily(self.bamini_family)
+            elif font.family().casefold().startswith("bamini"):
+                font.setFamily("Segoe UI")
+            char_format = QTextCharFormat()
+            char_format.setFont(font)
+            char_format.setForeground(option.palette.text())
+            cursor.insertText(part, char_format)
+
+        offset = max(0, rect.height() - document.size().height())
+        if option.displayAlignment & Qt.AlignmentFlag.AlignVCenter:
+            offset /= 2
+        elif not option.displayAlignment & Qt.AlignmentFlag.AlignBottom:
+            offset = 0
+        painter.save()
+        painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
+        painter.translate(rect.left() + 3, rect.top() + offset)
+        document.drawContents(painter)
+        painter.restore()
+
     def paint(self, painter: QPainter, option: 'QStyleOptionViewItem', index) -> None:
         painter.save()
         
@@ -102,7 +164,10 @@ class SpreadsheetDelegate(QStyledItemDelegate):
         if is_selected:
             opt.state &= ~QStyle.StateFlag.State_Selected
 
-        super().paint(painter, opt, index)
+        if self.bamini_family and has_tamil_unicode(str(index.data() or "")):
+            self._paint_unicode_tamil(painter, opt, index)
+        else:
+            super().paint(painter, opt, index)
 
         # 2. Draw our custom light-gray selection highlight ON TOP using Multiply
         # This brilliantly tints the cell and any custom fill colors while keeping text 100% visible.
@@ -197,7 +262,7 @@ class SpreadsheetWidget(QWidget):
         self.table.cellChanged.connect(self._cell_changed)
         self.table.currentCellChanged.connect(self._current_cell_changed)
         self.table.horizontalHeader().sectionResized.connect(lambda: self.table.resizeRowsToContents())
-        self.table.setFont(QFont("Bamini TAMIL", 10))
+        self.table.setFont(QFont("Segoe UI", DEFAULT_CELL_FONT_SIZE))
 
         # Right-click context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -256,11 +321,12 @@ class SpreadsheetWidget(QWidget):
         toolbar = self._build_toolbar()
         formula_bar = QHBoxLayout()
         formula_bar.addWidget(self.cell_label)
-        formula_bar.addWidget(self.formula_input)
+        formula_bar.addWidget(self.formula_input, 1)
         formula_bar.addWidget(self.status_label)
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(4)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
         layout.addWidget(toolbar)
         layout.addLayout(formula_bar)
         layout.addWidget(self.search_bar)
@@ -272,99 +338,121 @@ class SpreadsheetWidget(QWidget):
         self.history_index = 0
 
     def _build_toolbar(self) -> QWidget:
-        toolbar = QWidget()
-        toolbar.setStyleSheet("QWidget { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #f8fafc); border: 1px solid #e2e8f0; border-radius: 10px; padding: 3px; }")
-        
-        main_layout = QVBoxLayout(toolbar)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(4)
-        
-        row1_layout = QHBoxLayout()
-        row1_layout.setContentsMargins(0, 0, 0, 0)
-        row1_layout.setSpacing(3)
-        
-        row2_layout = QHBoxLayout()
-        row2_layout.setContentsMargins(0, 0, 0, 0)
-        row2_layout.setSpacing(3)
+        ribbon = QWidget()
+        ribbon.setObjectName("sheetRibbon")
+        ribbon.setStyleSheet("""
+            QWidget#sheetRibbon { background: #eef3f7; border: 1px solid #d5dfe8; border-radius: 6px; }
+            QWidget#sheetRibbon QToolButton {
+                background: transparent; border: 1px solid transparent;
+                border-radius: 4px; padding: 3px 6px; min-height: 22px;
+            }
+            QWidget#sheetRibbon QToolButton:hover { background: #dbeaf5; border-color: #bccfe0; }
+            QWidget#sheetRibbon QToolButton:pressed { background: #caddeb; }
+            QWidget#sheetRibbon QComboBox, QWidget#sheetRibbon QSpinBox {
+                background: white; border: 1px solid #bccbd8;
+                border-radius: 4px; padding: 2px 5px; min-height: 22px;
+            }
+            QWidget#sheetRibbon QComboBox:focus, QWidget#sheetRibbon QSpinBox:focus {
+                border-color: #47719a;
+            }
+        """)
+        layout = QVBoxLayout(ribbon)
+        layout.setContentsMargins(6, 5, 6, 5)
+        layout.setSpacing(3)
+        commands = QHBoxLayout()
+        formatting = QHBoxLayout()
+        for row in (commands, formatting):
+            row.setSpacing(3)
+            layout.addLayout(row)
 
-        actions_row1 = [
-            ("📂 Open", self.open_native, "neutral", "Ctrl+O"),
-            ("💾 Save", self.save_native, "success", "Ctrl+S"),
-            ("📄 Save As", self.save_native_as, "success", "Ctrl+Shift+S"),
-            ("📊 Export", self.export_xlsx, "export", "Ctrl+E"),
-            (None, None, None, None),
-            ("↩ Undo", self.undo, "neutral", "Ctrl+Z"),
-            ("↪ Redo", self.redo, "neutral", "Ctrl+Y"),
-            ("🗑 Clear Sheet", self.clear_sheet, "danger", None),
-        ]
-        
-        actions_row2 = [
-            ("𝐁", self.apply_bold, "format", "Ctrl+B"),
-            ("𝐼", self.apply_italic, "format", "Ctrl+I"),
-            ("U̲", self.apply_underline, "format", "Ctrl+U"),
-            ("🎨 Txt", self.apply_text_color, "format", None),
-            ("🪣 Fill", self.apply_fill_color, "format", None),
-            ("🔲 Borders", self.apply_borders, "format", None),
-            (None, None, None, None),
-            ("◀", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignLeft), "align", None),
-            ("◆", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignCenter), "align", None),
-            ("▶", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignRight), "align", None),
-            ("↩ Wrap", self.toggle_word_wrap, "align", None),
-            (None, None, None, None),
-            ("⊞ Merge", self.merge_selection, "merge", None),
-            ("⊟ Unmerge", self.unmerge_selection, "danger", None),
-            (None, None, None, None),
-            ("↕ Fit Rows", self.auto_fit_rows, "structure", None),
-            ("↔ Fit Cols", self.auto_fit_columns, "structure", None),
-            ("⬆➕ Row", self.insert_row_above, "structure", None),
-            ("⬅➕ Col", self.insert_column_left, "structure", None),
-            ("❌ Row", self.delete_row, "danger", None),
-            ("❌ Col", self.delete_column, "danger", None),
-            (None, None, None, None),
-            ("🔤 To Bamini", self.encode_selected_to_bamini, "training", None),
-            ("🔤 To Unicode", self.decode_selected_to_unicode, "training", None),
-        ]
+        def button(row, label, title, handler=None, *, icon=None, actions=()):
+            control = QToolButton()
+            control.setText(label)
+            control.setToolTip(title)
+            control.setAccessibleName(title)
+            if icon is not None:
+                control.setIcon(self.style().standardIcon(icon))
+                control.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            if actions:
+                menu = QMenu(control)
+                for name, action in actions:
+                    menu.addAction(name, action)
+                control.setMenu(menu)
+                control.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            else:
+                control.clicked.connect(handler)
+            row.addWidget(control)
+            return control
+
+        button(commands, "", "Open workbook", self.open_native, icon=QStyle.StandardPixmap.SP_DialogOpenButton)
+        button(commands, "", "Save workbook", self.save_native, icon=QStyle.StandardPixmap.SP_DialogSaveButton)
+        button(commands, "", "Export to Excel (Ctrl+E)", self.export_xlsx, icon=QStyle.StandardPixmap.SP_DialogApplyButton)
+        button(commands, "File", "File commands", actions=[
+            ("Save As", self.save_native_as),
+            ("Clear Sheet", self.clear_sheet),
+        ])
+        button(commands, "\u21b6", "Undo (Ctrl+Z)", self.undo)
+        button(commands, "\u21b7", "Redo (Ctrl+Y)", self.redo)
+        button(commands, "Find", "Find cells (Ctrl+F)", self._toggle_search_bar)
+        commands.addStretch()
+        button(commands, "Tools", "Open tools", actions=[
+            ("Petition Extractor", lambda: self._show_tool_panel("petition")),
+            ("AI Chat", lambda: self._show_tool_panel("chat")),
+            ("AI Training", lambda: self._show_tool_panel("training")),
+        ])
+        button(commands, "\u25eb", "Toggle tools panel", self._toggle_tool_panel)
 
         self.font_combo = QFontComboBox()
-        self.font_combo.setCurrentFont(QFont("Bamini TAMIL"))
-        self.font_combo.setFixedWidth(180)
+        self.font_combo.setCurrentFont(self.table.font())
+        self.font_combo.setMinimumWidth(74)
+        self.font_combo.setMaximumWidth(150)
+        self.font_combo.setToolTip("Font family")
+        self.font_combo.setAccessibleName("Font family")
         self.font_combo.currentFontChanged.connect(self.apply_font)
-        style_tool_button(self.font_combo, "format")
-        row2_layout.addWidget(self.font_combo)
+        formatting.addWidget(self.font_combo, 1)
 
-        for layout, actions in [(row1_layout, actions_row1), (row2_layout, actions_row2)]:
-            for label, handler, tone, shortcut in actions:
-                if label is None:
-                    sep = QWidget()
-                    sep.setFixedWidth(1)
-                    sep.setMinimumHeight(24)
-                    sep.setStyleSheet("background: #cbd5e1;")
-                    layout.addWidget(sep)
-                    continue
-                button = QPushButton(label)
-                button.clicked.connect(handler)
-                if shortcut:
-                    button.setToolTip(f"{label}  ({shortcut})")
-                style_tool_button(button, tone)
-                layout.addWidget(button)
+        self.font_size = QSpinBox()
+        self.font_size.setRange(6, 144)
+        self.font_size.setValue(DEFAULT_CELL_FONT_SIZE)
+        self.font_size.setFixedWidth(56)
+        self.font_size.setKeyboardTracking(False)
+        self.font_size.setToolTip("Font size in points")
+        self.font_size.setAccessibleName("Font size")
+        self.font_size.valueChanged.connect(self.apply_font_size)
+        formatting.addWidget(self.font_size)
 
-        row1_layout.addStretch(1)
-        row2_layout.addStretch(1)
+        button(formatting, "B", "Bold (Ctrl+B)", self.apply_bold)
+        button(formatting, "I", "Italic (Ctrl+I)", self.apply_italic)
+        button(formatting, "U", "Underline (Ctrl+U)", self.apply_underline)
+        button(formatting, "Format", "Cell formatting", actions=[
+            ("Text Color", self.apply_text_color),
+            ("Fill Color", self.apply_fill_color),
+            ("Borders", self.apply_borders),
+            ("Align Left", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignLeft)),
+            ("Align Center", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignCenter)),
+            ("Align Right", lambda: self.apply_alignment(Qt.AlignmentFlag.AlignRight)),
+            ("Wrap Text", self.toggle_word_wrap),
+            ("Convert to Bamini", self.encode_selected_to_bamini),
+            ("Convert to Unicode", self.decode_selected_to_unicode),
+        ])
+        button(formatting, "Cells", "Row, column, and merge commands", actions=[
+            ("Merge Cells", self.merge_selection),
+            ("Unmerge Cells", self.unmerge_selection),
+            ("Fit Rows", self.auto_fit_rows),
+            ("Fit Columns", self.auto_fit_columns),
+            ("Insert Row Above", self.insert_row_above),
+            ("Insert Column Left", self.insert_column_left),
+            ("Delete Row", self.delete_row),
+            ("Delete Column", self.delete_column),
+        ])
+        formatting.addStretch()
+        return ribbon
 
-        # Tools dropdown button on Row 1 — CHANGE 1: only 3 items
-        tools_btn = QPushButton("⚙ Tools ▼")
-        style_tool_button(tools_btn, "primary")
-        tools_menu = QMenu(self)
-        tools_menu.addAction("🛡 Petition Extractor", lambda: self._show_tool_panel("petition"))
-        tools_menu.addAction("🤖 AI Chat", lambda: self._show_tool_panel("chat"))
-        tools_menu.addAction("🧠 AI Training", lambda: self._show_tool_panel("training"))
-        tools_btn.setMenu(tools_menu)
-        row1_layout.addWidget(tools_btn)
-        
-        main_layout.addLayout(row1_layout)
-        main_layout.addLayout(row2_layout)
+    def _toggle_tool_panel(self) -> None:
+        window = self.window()
+        if hasattr(window, "toggle_tool_panel"):
+            window.toggle_tool_panel()
 
-        return toolbar
 
     def _raw_value(self, row: int, col: int) -> str:
         return self.raw_values.get((row, col), "")
@@ -373,7 +461,10 @@ class SpreadsheetWidget(QWidget):
         item = self.table.item(row, col)
         if item is None:
             item = QTableWidgetItem("")
-            item.setFont(QFont("Bamini TAMIL", 10))
+            font = self.table.font()
+            if font.pointSize() <= 0:
+                font.setPointSize(DEFAULT_CELL_FONT_SIZE)
+            item.setFont(font)
             self.table.setItem(row, col, item)
         return item
 
@@ -382,6 +473,9 @@ class SpreadsheetWidget(QWidget):
             return
         item = self.table.item(row, col)
         text = item.text() if item else ""
+        raw = self._raw_value(row, col)
+        if text == (self.engine.evaluate(raw) if raw.startswith("=") else raw):
+            return
         if text:
             self.raw_values[(row, col)] = text
         else:
@@ -395,6 +489,14 @@ class SpreadsheetWidget(QWidget):
             return
         self.cell_label.setText(f"{column_name(col)}{row + 1}")
         self.formula_input.setText(self.raw_values.get((row, col), self._display_value(row, col)))
+        self._sync_font_size()
+
+    def _sync_font_size(self) -> None:
+        item = self.table.currentItem()
+        font = item.font() if item else self.table.font()
+        with QSignalBlocker(self.font_size):
+            size = font.pointSize()
+            self.font_size.setValue(size if size > 0 else DEFAULT_CELL_FONT_SIZE)
 
     def _commit_formula_input(self) -> None:
         row = self.table.currentRow()
@@ -406,6 +508,13 @@ class SpreadsheetWidget(QWidget):
             self.raw_values[(row, col)] = text
         else:
             self.raw_values.pop((row, col), None)
+            self._updating = True
+            try:
+                item = self.table.item(row, col)
+                if item:
+                    item.setText("")
+            finally:
+                self._updating = False
         self.recalculate()
         self._mark_changed()
 
@@ -434,11 +543,6 @@ class SpreadsheetWidget(QWidget):
             for (row, col), raw in list(self.raw_values.items()):
                 item = self._ensure_item(row, col)
                 item.setText(self.engine.evaluate(raw) if raw.startswith("=") else raw)
-                # Ensure Bamini font is always applied so Tamil glyphs render correctly
-                f = item.font()
-                if f.family() not in ("Bamini TAMIL", "Bamini"):
-                    f.setFamily("Bamini TAMIL")
-                    item.setFont(f)
         finally:
             self._updating = False
 
@@ -453,33 +557,41 @@ class SpreadsheetWidget(QWidget):
         return items
 
     def apply_bold(self) -> None:
-        for item in self.selected_items_or_cells():
-            font = item.font()
-            font.setBold(not font.bold())
-            item.setFont(font)
-        self._mark_changed()
+        self._toggle_font_style(QFont.bold, QFont.setBold)
 
     def apply_italic(self) -> None:
-        for item in self.selected_items_or_cells():
-            font = item.font()
-            font.setItalic(not font.italic())
-            item.setFont(font)
-        self._mark_changed()
+        self._toggle_font_style(QFont.italic, QFont.setItalic)
 
     def apply_underline(self) -> None:
-        for item in self.selected_items_or_cells():
-            font = item.font()
-            font.setUnderline(not font.underline())
-            item.setFont(font)
-        self._mark_changed()
+        self._toggle_font_style(QFont.underline, QFont.setUnderline)
+
+    def _toggle_font_style(self, getter, setter) -> None:
+        items = self.selected_items_or_cells()
+        enabled = not all(getter(item.font()) for item in items)
+        self._format_fonts(items, lambda font: setter(font, enabled))
 
     def apply_font(self, font: QFont) -> None:
-        family = font.family()
-        for item in self.selected_items_or_cells():
-            f = item.font()
-            f.setFamily(family)
-            item.setFont(f)
-        self._mark_changed()
+        self._format_fonts(self.selected_items_or_cells(), lambda current: current.setFamily(font.family()))
+
+    def apply_font_size(self, size: int) -> None:
+        self._format_fonts(self.selected_items_or_cells(), lambda font: font.setPointSize(size))
+
+    def _format_fonts(self, items, change) -> None:
+        rows = set()
+        self._updating = True
+        try:
+            for item in items:
+                font = item.font()
+                change(font)
+                if font != item.font():
+                    item.setFont(font)
+                    rows.add(item.row())
+            for row in rows:
+                self.table.resizeRowToContents(row)
+        finally:
+            self._updating = False
+        if rows:
+            self._mark_changed()
 
     def encode_selected_to_bamini(self) -> None:
         from bamini import unicode_to_bamini
@@ -964,7 +1076,6 @@ class SpreadsheetWidget(QWidget):
         ]
         if not rows:
             return self._next_empty_row(), 0
-        rows = convert_rows_to_bamini(rows)
         checks = [money_check(row) for row in rows]
         include_money_check = any(check for check in checks)
         self.set_template_columns(template, include_money_check)
@@ -984,10 +1095,6 @@ class SpreadsheetWidget(QWidget):
                     value = check if field_name == MONEY_CHECK_COLUMN else values.get(field_name, "")
                     item.setText(value)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-                    # Force Bamini TAMIL font so ASCII Bamini sequences display as proper Tamil glyphs
-                    f = item.font()
-                    f.setFamily("Bamini TAMIL")
-                    item.setFont(f)
                     if value:
                         self.raw_values[(current_row, col)] = value
                     else:
@@ -1021,7 +1128,13 @@ class SpreadsheetWidget(QWidget):
         writer_buffer.append(",".join(csv_escape(headers[col]) for col in active_cols))
         rows_added = 0
         for row in range(self.table.rowCount()):
-            values = [bamini_to_unicode(self._display_value(row, col)) for col in active_cols]
+            values = []
+            for col in active_cols:
+                item = self.table.item(row, col)
+                value = item.text() if item else ""
+                if item and item.font().family().casefold().startswith("bamini") and not has_tamil_unicode(value):
+                    value = bamini_to_unicode(value)
+                values.append(value)
             if not any(values):
                 continue
             writer_buffer.append(",".join(csv_escape(value) for value in values))
@@ -1139,6 +1252,7 @@ class SpreadsheetWidget(QWidget):
         }
 
     def load_state(self, state: dict[str, object]) -> None:
+        current_row, current_col = self.table.currentRow(), self.table.currentColumn()
         for start_row, start_col, _row_span, _col_span in self.merged_ranges:
             self.table.setSpan(start_row, start_col, 1, 1)
         row_count = max(200, int(state.get("row_count", 200)))
@@ -1175,6 +1289,8 @@ class SpreadsheetWidget(QWidget):
                     self.raw_values[(row, col)] = raw
                 if raw.count("\n"):
                     self.table.setRowHeight(row, max(28, min(120, 24 * (raw.count("\n") + 1))))
+                if item.font().pointSize() != DEFAULT_CELL_FONT_SIZE:
+                    self.table.resizeRowToContents(row)
             for merged in state.get("merged_ranges", []):
                 if not isinstance(merged, list) and not isinstance(merged, tuple):
                     continue
@@ -1186,6 +1302,9 @@ class SpreadsheetWidget(QWidget):
         finally:
             self._updating = False
         self.recalculate()
+        if 0 <= current_row < row_count and 0 <= current_col < column_count:
+            self.table.setCurrentCell(current_row, current_col)
+        self._sync_font_size()
 
     def export_xlsx(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export Excel workbook", "extracted_data.xlsx", "Excel Workbook (*.xlsx)")
@@ -1203,7 +1322,9 @@ class SpreadsheetWidget(QWidget):
         for out_col, col in enumerate(active_cols, start=1):
             header = self.table.horizontalHeaderItem(col)
             c = sheet.cell(row=1, column=out_col, value=header.text() if header else column_name(col))
-            c.font = Font(name="Bamini TAMIL", bold=True)
+            c.font = Font(name="Segoe UI", bold=True)
+            if has_tamil_unicode(c.value):
+                self._apply_xlsx_tamil(c)
 
         for row in range(self.table.rowCount()):
             if not any(self._display_value(row, col) or self.raw_values.get((row, col)) for col in active_cols):
@@ -1220,6 +1341,7 @@ class SpreadsheetWidget(QWidget):
                     font_color = qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None
                     cell.font = Font(
                         name=font.family(),
+                        size=font.pointSize() if font.pointSize() > 0 else DEFAULT_CELL_FONT_SIZE,
                         bold=font.bold(),
                         italic=font.italic(),
                         underline="single" if font.underline() else None,
@@ -1232,6 +1354,8 @@ class SpreadsheetWidget(QWidget):
                         vertical="top" if "\n" in str(raw) else "center",
                         wrap_text="\n" in str(raw),
                     )
+                if has_tamil_unicode(raw) and not raw.startswith("="):
+                    self._apply_xlsx_tamil(cell)
 
         for start_row, start_col, row_span, col_span in self.merged_ranges:
             if start_col in active_cols:
@@ -1247,6 +1371,26 @@ class SpreadsheetWidget(QWidget):
         for index, col in enumerate(active_cols, start=1):
             sheet.column_dimensions[get_column_letter(index)].width = max(12, self.table.columnWidth(col) / 7)
         workbook.save(path)
+
+    def _apply_xlsx_tamil(self, cell) -> None:
+        font = copy(cell.font)
+        bamini = self.table.itemDelegate().bamini_family or "Bamini TAMIL"
+        english = font.name or "Segoe UI"
+        if english.casefold().startswith("bamini"):
+            english = "Segoe UI"
+        runs = bamini_display_runs(cell.value)
+        if not any(is_bamini for _, is_bamini in runs):
+            return
+        cell.value = CellRichText([
+            TextBlock(
+                InlineFont(
+                    rFont=bamini if is_bamini else english,
+                    sz=font.sz, b=font.b, i=font.i, u=font.u, color=font.color,
+                ),
+                text,
+            )
+            for text, is_bamini in runs
+        ])
 
 
 class TemplateManagerWidget(QWidget):
@@ -1753,9 +1897,7 @@ class ChatPanel(QWidget):
         rag_context = ""
         self._pending_citations = []
         try:
-            from bamini import bamini_to_unicode
-            unicode_question = bamini_to_unicode(question)
-            chunks = self.rag.search(unicode_question, n_results=5)
+            chunks = self.rag.search(question, n_results=5)
             if chunks:
                 lines = []
                 for idx, c in enumerate(chunks, start=1):
@@ -1799,7 +1941,6 @@ class ChatPanel(QWidget):
         self.chat_view.setHtml(CHAT_CSS + '<div class="clear"></div>')
 
     def build_prompt(self, table_context: str, rag_context: str, history: list[tuple[str, str]], question: str) -> str:
-        from bamini import bamini_to_unicode
         recent_history = history[-8:]
         lines = [
             "You are a local AI assistant. You have access to a structured spreadsheet and an unstructured knowledge base.",
@@ -1814,8 +1955,8 @@ class ChatPanel(QWidget):
             "Recent conversation:",
         ]
         for role, content in recent_history:
-            lines.append(f"{role}: {bamini_to_unicode(content)}")
-        lines.extend(["", f"User: {bamini_to_unicode(question)}", "Assistant:"])
+            lines.append(f"{role}: {content}")
+        lines.extend(["", f"User: {question}", "Assistant:"])
         return "\n".join(lines)
 
 
@@ -1934,7 +2075,7 @@ class PetitionThread(QThread):
                     self.file_finished.emit(base_name, 0)
                     continue
 
-                results = convert_rows_to_bamini(_clean_extracted_rows(results, self.headers))
+                results = _clean_extracted_rows(results, self.headers)
                 for row in results:
                     row["_file_path"] = file_path
                     self.row_extracted.emit(row)
@@ -2079,37 +2220,25 @@ class PetitionWidget(QWidget):
         self.log.setPlaceholderText("Extraction log will appear here...")
         self.log.setStyleSheet(PETITION_LOG_STYLE)
 
-        # CHANGE 6: Proper multi-row layout for controls
-        # Row 1: Engine + Load Petitions
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Engine:"))
-        row1.addWidget(self.engine_combo)
-        row1.addWidget(btn_load, 1)
+        fields = QFormLayout()
+        fields.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        fields.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        fields.addRow("Engine", self.engine_combo)
+        fields.addRow("Preset", model_combo)
+        fields.addRow("Model", self.model_input)
+        fields.addRow(self.gemini_key_label, self.gemini_key)
+        fields.addRow("Training", self.fewshot_combo)
 
-        # Row 2: Model preset + model input
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Model:"))
-        row2.addWidget(model_combo, 1)
-        row2.addWidget(self.model_input, 1)
-
-        # Row 3: Gemini key (hidden by default)
-        self.gemini_key_row = QHBoxLayout()
-        self.gemini_key_row.addWidget(self.gemini_key_label)
-        self.gemini_key_row.addWidget(self.gemini_key, 1)
-
-        # Row 4: Training template + Edit Prompt + Set Headers
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("Training:"))
-        row4.addWidget(self.fewshot_combo, 1)
-        row4.addWidget(btn_prompt)
-        row4.addWidget(btn_set_headers)
+        actions = QHBoxLayout()
+        actions.addWidget(btn_prompt)
+        actions.addWidget(btn_set_headers)
+        self.stats.setWordWrap(True)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
-        layout.addLayout(self.gemini_key_row)
-        layout.addLayout(row4)
+        layout.addWidget(btn_load)
+        layout.addLayout(fields)
+        layout.addLayout(actions)
         layout.addWidget(self.status)
         layout.addWidget(self.stats)
         layout.addWidget(self.progress)
@@ -2451,7 +2580,6 @@ class PetitionWidget(QWidget):
         self.progress.setValue(cur)
 
     def _on_row(self, data):
-        data = convert_values_to_bamini(data)
         headers = self._active_headers or self._get_headers()
         if not any(_is_meaningful_extracted_value(data.get(header, "")) for header in headers):
             return
@@ -3093,7 +3221,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("KAAVAL — Knowledge & Advanced Analysis for Vigilance & Asset Loss")
-        self.resize(1500, 920)
+        screen = self.screen().availableGeometry()
+        self.resize(min(1500, screen.width() - 32), min(920, screen.height() - 64))
 
         self.store = TemplateStore()
         self.fewshot_store = FewShotStore()
@@ -3126,8 +3255,12 @@ class MainWindow(QMainWindow):
             ("template", self.templates, "📋 Templates"),
             ("notebook", self.sources, "📚 Notebook"),
         ]:
-            self.tool_stack.addWidget(widget)
-            self.tool_panels[name] = (widget, label)
+            pane = QScrollArea()
+            pane.setWidgetResizable(True)
+            pane.setFrameShape(QScrollArea.Shape.NoFrame)
+            pane.setWidget(widget)
+            self.tool_stack.addWidget(pane)
+            self.tool_panels[name] = (pane, label)
 
         # Side panel header with back button and title — default to Petition
         self.panel_title = QLabel("🛡 Petition Extractor")
@@ -3148,9 +3281,9 @@ class MainWindow(QMainWindow):
         panel_header.addWidget(self.panel_title, 1)
 
         # CHANGE 7: wider right panel
-        right_panel = QWidget()
-        right_panel.setMinimumWidth(360)
-        self.spreadsheet.setMinimumWidth(200)
+        right_panel = self.right_panel = QWidget()
+        right_panel.setMinimumWidth(300)
+        self.spreadsheet.setMinimumWidth(420)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(4)
@@ -3161,6 +3294,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.spreadsheet)
         splitter.addWidget(right_panel)
         splitter.setSizes([1100, 400])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
         splitter.setHandleWidth(6)
         splitter.setChildrenCollapsible(False)
 
@@ -3198,11 +3333,15 @@ class MainWindow(QMainWindow):
 
     def show_tool_panel(self, name: str) -> None:
         if name in self.tool_panels:
+            self.right_panel.show()
             widget, label = self.tool_panels[name]
             self.tool_stack.setCurrentWidget(widget)
             self.panel_title.setText(label)
             # CHANGE 7: back button visibility — hide when on petition (default)
             self.panel_back_btn.setVisible(name != "petition")
+
+    def toggle_tool_panel(self) -> None:
+        self.right_panel.setVisible(self.right_panel.isHidden())
 
     def _check_ollama_connection(self) -> None:
         client = OllamaClient()
@@ -3243,6 +3382,8 @@ def item_has_custom_style(item: QTableWidgetItem | None) -> bool:
         font.bold()
         or font.italic()
         or font.underline()
+        or (font.pointSize() > 0 and font.pointSize() != DEFAULT_CELL_FONT_SIZE)
+        or font.family() != "Segoe UI"
         or item.foreground().style() != Qt.BrushStyle.NoBrush
         or item.background().style() != Qt.BrushStyle.NoBrush
         or item.textAlignment() != 0
@@ -3260,6 +3401,7 @@ def item_to_style(item: QTableWidgetItem | None) -> dict[str, object]:
         "italic": font.italic(),
         "underline": font.underline(),
         "family": font.family(),
+        "point_size": font.pointSize(),
         "foreground": qcolor_to_rgb(foreground.color()) if foreground.style() != Qt.BrushStyle.NoBrush else None,
         "background": qcolor_to_rgb(background.color()) if background.style() != Qt.BrushStyle.NoBrush else None,
         "alignment": int(item.textAlignment()),
@@ -3272,6 +3414,9 @@ def apply_item_style(item: QTableWidgetItem, style: object) -> None:
     font = item.font()
     if style.get("family"):
         font.setFamily(str(style.get("family")))
+    size = style.get("point_size")
+    if isinstance(size, int) and 6 <= size <= 144:
+        font.setPointSize(size)
     font.setBold(bool(style.get("bold")))
     font.setItalic(bool(style.get("italic")))
     font.setUnderline(bool(style.get("underline")))

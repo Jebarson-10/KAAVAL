@@ -15,6 +15,15 @@ from document import image_to_base64_png, prepare_for_vision
 from templates import ExtractionTemplate
 
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+PETITION_LANGUAGE_RULES = (
+    "Read the petition in context. Transcribe Tamil passages in proper Unicode Tamil, "
+    "including when the document uses a legacy Tamil font. Use natural Tamil for any "
+    "summary of Tamil passages. Copy English words, names, and phrases from the source "
+    "in English with their original spelling; do not translate or transliterate them. "
+    "Keep mixed-language fields mixed. Preserve identifiers, dates, amounts, and numbers. "
+    "Never output Bamini keystrokes. Training examples are for field structure and do "
+    "not override these language rules."
+)
 
 try:
     import pytesseract  # type: ignore
@@ -215,7 +224,7 @@ class OllamaClient:
         if text:
             prompt += f"\n\nDocument Text:\n{text}"
 
-        system = "You are a precise data extraction engine. Output must be valid JSON array only."
+        system = f"You are a precise data extraction engine. Output must be valid JSON array only. {PETITION_LANGUAGE_RULES}"
         model = self.vision_model if images else self.chat_model
         response = self.generate(prompt, model=model, images=all_images if all_images else None, json_mode=True, system=system)
         return parse_json_rows(response, headers)
@@ -371,7 +380,10 @@ class GeminiClient:
             },
             "required": ["rows"],
         }
-        system = "You are a precise Tamil-English legal and financial document extraction engine. Output valid JSON only."
+        system = (
+            "You are a precise Tamil-English legal and financial document extraction engine. "
+            f"Output valid JSON only. {PETITION_LANGUAGE_RULES}"
+        )
         response = self.generate(prompt, images=all_images if all_images else None, system=system, schema=schema)
         return parse_json_rows(response, headers)
 

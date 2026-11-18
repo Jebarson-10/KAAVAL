@@ -16,6 +16,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [v1.0.1]
+
+### Fixed
+- Reorganized the spreadsheet ribbon and petition tools to fit smaller windows.
+- Added a font-size control and preserved formulas during cell formatting.
+- Rendered Tamil in Bamini and retained source English in mixed-language cells.
+
+---
+
 ## [v1.0.0] — Initial Release
 
 ### Added
